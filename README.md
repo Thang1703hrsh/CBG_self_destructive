@@ -1,6 +1,6 @@
 # Self-Destructive Language Model
 
-This is the offical implemation of "Self-Destructive Language Model".
+This is the offical implemation of "[Self-Destructive Language Model](https://openreview.net/forum?id=ERNpUGr8M5)", ICLR 2026.
 <!-- ![](pipeline.png) -->
 <img src="pipeline.png" width="60%">
 
@@ -20,6 +20,8 @@ This is the offical implemation of "Self-Destructive Language Model".
     - [Configuration Settings](#configuration-settings)
     - [Model Training](#model-training)
     - [Model Evaluation](#model-evaluation)
+  - [🎉 Acknowledgments](#-acknowledgments)
+  - [📝 Citation](#-citation)
 
 ## 🛠️ Setup
 
@@ -86,3 +88,20 @@ bash scripts/train.sh
 ```bash
 bash scripts/eval.sh
 ```
+
+## 🎉 Acknowledgments
+This codebase is constructed based on the [representation-noising](https://github.com/domenicrosati/representation-noising) repository. Thanks to the authors for their great work!
+
+
+## 📝 Citation
+If you find this codebase useful, please cite our paper:
+```
+@inproceedings{
+wang2026selfdestructive,
+title={Self-Destructive Language Models},
+author={Yuhui Wang and Rongyi Zhu and Ting Wang},
+booktitle={The Fourteenth International Conference on Learning Representations},
+year={2026},
+url={https://openreview.net/forum?id=ERNpUGr8M5}
+}
+``` 
