@@ -52,10 +52,18 @@ def construct_beavertails_dataset(
     attack= False,
     attack_size=1000,
     defence_size=1000,
-    context_length=CONTEXT_LENGTH
+    context_length=CONTEXT_LENGTH,
+    split_manifest_path=None,
+    beavertails_path="data/beavertails_with_refusals_train.json",
 ):
-    with open("data/beavertails_with_refusals_train.json", "r", encoding = "utf-8") as f:
-        trainds = json.load(f)
+    if split_manifest_path is not None:
+        from src.data_processing.cbg_datasets import load_manifest_attack_records
+        if train_harmful_subset != "all" or withhold_harmful_subset:
+            raise ValueError("manifest evaluation uses the declared held-out rows without subset filtering")
+        trainds = load_manifest_attack_records(beavertails_path, split_manifest_path, attack_size=attack_size)
+    else:
+        with open(beavertails_path, "r", encoding = "utf-8") as f:
+            trainds = json.load(f)
     trainds = Dataset.from_list(trainds)
     testds = load_dataset("PKU-Alignment/BeaverTails", split="30k_test")
     # prepare tokenizer where we have the subsets
@@ -246,7 +254,10 @@ def construct_beavertails_dataset(
     # only select 100 samples to test on
     if len(tokenized_test) > 100:
         tokenized_test = tokenized_test.select(range(100))
-    if attack:
+    if split_manifest_path is not None:
+        if len(tokenized_harmful) != attack_size or len(tokenized_harmless) != attack_size:
+            raise ValueError("tokenization changed the manifest attack pool size")
+    elif attack:
         if attack_size < len(tokenized_harmful):
             tokenized_harmful = tokenized_harmful.select(range(attack_size))
             tokenized_harmless = tokenized_harmless.select(range(attack_size))

@@ -1,5 +1,9 @@
 """Mathematical core for Collateral Barrier Geometry (CBG)."""
 
+from src.cbg.dual import build_functional_kernel, dual_rayleigh_solve
+from src.cbg.bounded import bounded_rayleigh_solve, compute_complement_enclosure
+from src.cbg.spec import SpecConfig, SpecStepResult, measure_geometry, spec_training_gradient
+
 from src.cbg.functionals import (
     benign_kl_from_logits,
     benign_functional_map,
@@ -31,6 +35,7 @@ from src.cbg.spectral_grad import (
     SpectralCenter,
     SpectralGradientResult,
     centered_spectral_gradient,
+    direct_spectral_gradient,
     choose_physical_delta,
     compose_training_gradient,
     compute_spectral_center,
@@ -54,6 +59,12 @@ from src.cbg.tree_ops import (
 )
 
 __all__ = [
+    "SpecConfig", "SpecStepResult", "measure_geometry", "spec_training_gradient",
+    "bounded_rayleigh_solve",
+    "compute_complement_enclosure",
+    "direct_spectral_gradient",
+    "build_functional_kernel",
+    "dual_rayleigh_solve",
     "sequence_chunks",
     "select_response_logits",
     "metric_product_with_jvp",

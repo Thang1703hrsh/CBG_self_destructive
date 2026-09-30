@@ -10,16 +10,16 @@ from typing import TypeAlias
 
 import torch
 from torch import Tensor
-from torch.func import jvp, vjp
+from torch.func import jvp, vjp, vmap
 from src.cbg.functionals import BatchedFunctional, FunctionalBlock
 
 from src.cbg.tree_ops import (
     OrderedTensorTree,
     TensorTree,
+    accumulate_detached_gradient,
     assert_same_structure,
     tree_add,
     tree_detach,
-    tree_scale,
 )
 
 
@@ -77,6 +77,92 @@ def functional_jvp(
     return values, directional_values
 
 
+def block_vjp(block: FunctionalBlock, parameters: TensorTree, cotangent: Tensor) -> OrderedTensorTree:
+    """Detached pullback, freeing each signed response graph before the next."""
+    result = None
+    with torch.no_grad():
+        for scale, term in block.terms:
+            values, pullback = vjp(term, parameters)
+            _validate_functional_output(values)
+            if values.shape != cotangent.shape:
+                raise ValueError("cotangent shape differs from the functional block")
+            pulled = pullback(scale * cotangent.to(values))[0]
+            result = accumulate_detached_gradient(result, pulled)
+            del values, pullback, pulled
+    assert result is not None
+    return tree_detach(result)
+
+
+def functional_jvp_directions(functional, parameters, directions):
+    """Detached JVPs for a bounded block of directions, sharing primal work.
+
+    The leading leaf axis indexes directions, NOT data examples. Each signed
+    response term is evaluated separately so at most one term's tangent
+    activations are live. randomness='error' rejects stochastic execution.
+    This helper is for the detached eigensolver, not the outer derivative.
+    """
+    if not directions:
+        raise ValueError("directions must be nonempty")
+    for direction in directions:
+        assert_same_structure(parameters, direction)
+    with torch.no_grad():
+        stacked = OrderedDict((name, torch.stack([v[name] for v in directions]))
+                              for name in parameters)
+        pieces = []
+        for block in functional_blocks(functional):
+            total = None
+            for scale, term in block.terms:
+                def tangent(v):
+                    return jvp(term, (parameters,), (v,))[1]
+                part = vmap(tangent, randomness="error")(stacked)
+                total = scale * part if total is None else total + scale * part
+                del part
+            pieces.append(total)
+        return torch.cat(pieces, dim=1).detach()
+
+
+def functional_vjp(functional: FunctionalMap, parameters: TensorTree, cotangent: Tensor) -> OrderedTensorTree:
+    """Detached streamed J^T c; no batch-by-parameter tensor is assembled."""
+    offset, result = 0, None
+    for block in functional_blocks(functional):
+        size = block.size or cotangent.numel()
+        pulled = block_vjp(block, parameters, cotangent[offset:offset + size])
+        # block_vjp already returns privately owned detached storage.
+        result = pulled if result is None else accumulate_detached_gradient(result, pulled)
+        offset += size
+        del pulled
+    if offset != cotangent.numel():
+        raise ValueError("cotangent size differs from the complete functional")
+    assert result is not None
+    return tree_detach(result)
+
+
+def normalized_functional_rows(functional: FunctionalMap, parameters: TensorTree):
+    """Yield rows of J/sqrt(output size) as individual signed VJP trees.
+
+    Consumers must release each row; collecting this iterator would assemble
+    a Jacobian transpose and is prohibited in production.
+    """
+    blocks = functional_blocks(functional)
+    sizes = []
+    with torch.no_grad():
+        for block in blocks:
+            size = block.size
+            if not size:
+                values = block(parameters)
+                _validate_functional_output(values)
+                size = values.numel()
+                del values
+            sizes.append(size)
+        total = sum(sizes)
+        leaf = next(iter(parameters.values()))
+        for block, size in zip(blocks, sizes):
+            for index in range(size):
+                cotangent = leaf.new_zeros(size)
+                cotangent[index] = total ** -0.5
+                yield block_vjp(block, parameters, cotangent)
+
+
 def metric_vector_product(
     functional: FunctionalMap,
     parameters: TensorTree,
@@ -128,7 +214,9 @@ def metric_product_with_jvp(
                     raise ValueError("functional block size changed during metric evaluation")
                 cotangent = scale * weighted[offset:offset + size]
                 pulled = pullback(cotangent)[0]
-                if result is None:
+                if detach_result:
+                    result = accumulate_detached_gradient(result, pulled)
+                elif result is None:
                     result = OrderedDict((name, pulled[name]) for name in parameters)
                 else:
                     result = tree_add(result, pulled)
@@ -167,5 +255,5 @@ def damped_benign_metric_vector_product(
         weight=weight,
         detach_result=detach_result,
     )
-    result = tree_add(gb_direction, tree_scale(direction, mu))
+    result = tree_add(gb_direction, direction, alpha=mu)
     return tree_detach(result) if detach_result else result

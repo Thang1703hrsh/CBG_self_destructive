@@ -89,6 +89,75 @@ def tree_norm(tree: TensorTree) -> Tensor:
     return torch.sqrt(torch.clamp_min(squared_norm, 0.0))
 
 
+def tree_dot_fp64_detached(
+    a: TensorTree, b: TensorTree, *, chunk_elements: int = 262144,
+) -> Tensor:
+    """FP64 solver contraction with bounded conversion/multiplication workspace.
+
+    Unlike converting entire trees to double, workspace does not scale with P.
+    Split views also support noncontiguous leaves without flattening/copying them.
+    This helper deliberately has no derivative; use tree_dot for autograd.
+    """
+    assert_same_structure(a, b)
+    if isinstance(chunk_elements, bool) or not isinstance(chunk_elements, int) or chunk_elements < 1:
+        raise ValueError("chunk_elements must be a positive integer")
+    with torch.no_grad():
+        result = next(iter(a.values())).new_zeros((), dtype=torch.float64)
+        for name in a:
+            pending = [(a[name], b[name])]
+            while pending:
+                x, y = pending.pop()
+                if x.numel() <= chunk_elements:
+                    result.add_((x.double() * y.double()).sum())
+                else:
+                    axis = max(range(x.ndim), key=lambda i: x.shape[i])
+                    size = max(1, x.shape[axis] // 2)
+                    pending.extend(zip(x.split(size, dim=axis), y.split(size, dim=axis)))
+        return result
+
+
+def accumulate_detached_gradient(
+    accumulator: OrderedTensorTree | None, contribution: TensorTree, *,
+    alpha: float | Tensor = 1.0,
+) -> OrderedTensorTree:
+    """Sum into a PRIVATE detached accumulator, never an autograd-returned alias.
+
+    The first contribution is cloned: even detached gradients can alias live
+    parameters for simple functions. Callers must own subsequent accumulators.
+    """
+    if isinstance(alpha, Tensor):
+        if alpha.numel() != 1:
+            raise ValueError("gradient accumulation alpha must be scalar")
+        alpha_value = float(alpha.detach())
+    else:
+        alpha_value = float(alpha)
+    if accumulator is None:
+        return OrderedDict((name, value.detach().clone().mul_(alpha_value))
+                           for name, value in contribution.items())
+    assert_same_structure(accumulator, contribution)
+    if any(v.requires_grad or v.grad_fn is not None for v in accumulator.values()):
+        raise ValueError("gradient accumulator must be detached and privately owned")
+    if any(accumulator[n].dtype != contribution[n].dtype for n in accumulator):
+        raise ValueError("gradient accumulation must not silently change dtype")
+    with torch.no_grad():
+        for name, value in contribution.items():
+            accumulator[name].add_(value, alpha=alpha_value)
+    return accumulator
+
+
+def scale_owned_detached_tree_(tree: OrderedTensorTree, scalar: float | Tensor) -> OrderedTensorTree:
+    """Scale private detached storage in place, rejecting graph-bearing leaves."""
+    _validate_tree(tree, name="tree")
+    if not isinstance(tree, OrderedDict):
+        raise TypeError("in-place scaling requires an owned OrderedDict")
+    if any(value.requires_grad or value.grad_fn is not None for value in tree.values()):
+        raise ValueError("in-place scaling requires detached leaves")
+    with torch.no_grad():
+        for value in tree.values():
+            value.mul_(scalar)
+    return tree
+
+
 def tree_scale(tree: TensorTree, scalar: float | Tensor) -> OrderedTensorTree:
     _validate_tree(tree, name="tree")
     return OrderedDict((key, value * scalar) for key, value in tree.items())
@@ -123,6 +192,44 @@ def tree_detach(tree: TensorTree) -> OrderedTensorTree:
 def tree_zeros_like(tree: TensorTree) -> OrderedTensorTree:
     _validate_tree(tree, name="tree")
     return OrderedDict((key, torch.zeros_like(value)) for key, value in tree.items())
+
+
+def tree_linear_combination(trees: Sequence[TensorTree], coefficients: Tensor) -> OrderedTensorTree:
+    """Small subspace combination without stacking parameter-sized leaves."""
+    if not trees or coefficients.ndim != 1 or len(trees) != coefficients.numel():
+        raise ValueError("one scalar coefficient is required per tree")
+    for vector in trees[1:]:
+        assert_same_structure(trees[0], vector)
+    if torch.is_grad_enabled() and (coefficients.requires_grad or any(
+        value.requires_grad for vector in trees for value in vector.values()
+    )):
+        # Preserve the generic algebra API for differentiable callers. Only
+        # detached solver algebra may use the in-place fast path below.
+        result = tree_zeros_like(trees[0])
+        for vector, coefficient in zip(trees, coefficients):
+            result = OrderedDict((name, result[name] + coefficient.to(value) * value)
+                                 for name, value in vector.items())
+        return result
+    # Solver vectors are detached. Construct one owned result tree and apply
+    # subsequent small-basis coefficients in place instead of allocating a
+    # fresh P-vector for every basis column.
+    result = OrderedDict()
+    with torch.no_grad():
+        first = float(coefficients[0].detach())
+        for name, value in trees[0].items():
+            result[name] = value.detach().clone().mul_(first)
+        for vector, coefficient in zip(trees[1:], coefficients[1:]):
+            alpha = float(coefficient.detach())
+            for name, value in vector.items():
+                result[name].add_(value, alpha=alpha)
+    return result
+
+
+def tree_gram(left: Sequence[TensorTree], right: Sequence[TensorTree]) -> Tensor:
+    """Small matrix of tree dot products; never stack parameter vectors."""
+    if not left or not right:
+        raise ValueError("tree Gram operands must be nonempty")
+    return torch.stack([torch.stack([tree_dot(a, b) for b in right]) for a in left])
 
 
 def tree_random_like(

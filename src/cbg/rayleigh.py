@@ -43,13 +43,34 @@ class RayleighDiagnostics:
     converged: bool
     rejected_steps: int
     metric_evaluations: int
+    zero_safety: bool = False
+    eigengap: Tensor | None = None
+    kernel_asymmetry: Tensor | None = None
+    kernel_projection: Tensor | None = None
+    kernel_columns: int = 0
+    damping_fraction: Tensor | None = None
+    dual_value_error: Tensor | None = None
+    enclosure_lower: Tensor | None = None
+    enclosure_upper: Tensor | None = None
+    enclosure_eta: Tensor | None = None
+    enclosure_gamma: Tensor | None = None
+    b_orthogonality: Tensor | None = None
+    basis_size: int = 0
+    enclosure_checks: int = 0
+    safety_row_pullbacks: int = 0
+    dual_fallback: bool = False
+    ritz_eigengap: Tensor | None = None
+    fallback_reason: str | None = None
+    refinement_steps: int = 0
+    refinement_jvps: int = 0
 
 
 @dataclass(frozen=True)
 class RayleighResult:
     direction: OrderedTensorTree
     diagnostics: RayleighDiagnostics
-    center: SpectralCenter
+    center: SpectralCenter | None
+    warm_basis: tuple[OrderedTensorTree, ...] = ()
 
 
 def calibrate_relative_damping(

@@ -1,5 +1,15 @@
 # Self-Destructive Language Model
 
+This workspace also contains Collateral Barrier Geometry. The implementation
+matching `CBG_implementation_spec.md` is selected with `cbg_version: spec`.
+See [CBG implementation and validation](CBG_SPEC_IMPLEMENTATION.md) for the
+equations, checks, pilot command, and current limitations. The older V2/V5
+configurations retain their original single-mode objective for reproducibility.
+For the scenario workflow, data splits, calibration gates, attacks and evaluation,
+see the [CBG scenario runbook](CBG_SCENARIO_RUNBOOK.md) and
+[protocol configuration](config/cbg_scenarios.yaml).
+For the first Modal pilot, follow the [S0 Modal runbook](CBG_MODAL_S0_RUNBOOK.md).
+
 This is the offical implemation of "[Self-Destructive Language Model](https://openreview.net/forum?id=ERNpUGr8M5)", ICLR 2026.
 <!-- ![](pipeline.png) -->
 <img src="pipeline.png" width="60%">
@@ -104,4 +114,4 @@ booktitle={The Fourteenth International Conference on Learning Representations},
 year={2026},
 url={https://openreview.net/forum?id=ERNpUGr8M5}
 }
-``` 
+```

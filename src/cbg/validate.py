@@ -18,6 +18,7 @@ from torch.func import jacrev, jvp, vjp
 
 from src.cbg.functionals import make_safety_functional, make_benign_functional, safe_alignment_loss
 from src.cbg.geometry import MetricProduct
+from src.cbg.dual import dual_rayleigh_solve
 from src.cbg.rayleigh import calibrate_relative_damping, warm_started_rayleigh_ascent
 from src.cbg.spectral_grad import (
     centered_spectral_gradient, compute_spectral_center, choose_physical_delta,
@@ -255,14 +256,108 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--v2", action="store_true", help="validate dual solve and token-block benign geometry")
+    parser.add_argument("--v5", action="store_true", help="validate direct AD, FD oracle and bounded Ritz")
     args = parser.parse_args()
     torch.set_num_threads(1)
-    report = run(torch.device(args.device))
+    if args.v2 and args.v5:
+        parser.error("choose only one validation version")
+    report = run_v5(torch.device(args.device)) if args.v5 else (run_v2(torch.device(args.device)) if args.v2 else run(torch.device(args.device)))
     text = json.dumps(report, indent=2, allow_nan=False)
     print(text)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(text + "\n", encoding="utf-8")
+
+
+def run_v2(device):
+    """Small, reproducible diagnostics. No actual-model performance inference."""
+    model, parameters, harmful, safe, benign = fixture(device)
+    fh = make_safety_functional(model, harmful, safe, chunk_size=1)
+    original_fb = make_benign_functional(model, benign, chunk_size=1)
+    mu = float(calibrate_relative_damping(original_fb, parameters,
+        generator=torch.Generator(device=device).manual_seed(7)))
+    report = dict(scope="FP64 toy; fixed mu across metrics, no Llama claims",
+                  torch=torch.__version__, device=str(device), mu=mu, variants=[])
+    for blocks in (1, 2):
+        fb = make_benign_functional(model, benign, chunk_size=1, token_blocks=blocks)
+        solve = lambda: dual_rayleigh_solve(fh, fb, parameters, mu=mu, tolerance=1e-8)
+        result = solve()
+        h_jac, b_jac = jacrev(fh)(parameters), jacrev(fb)(parameters)
+        h = torch.cat([v.reshape(3, -1) for v in h_jac.values()], dim=1)
+        b = torch.cat([v.reshape(3 * blocks, -1) for v in b_jac.values()], dim=1)
+        gh, gb = h.T @ h / 3, b.T @ b / (3 * blocks)
+        cholesky = torch.linalg.cholesky(gb + mu * torch.eye(gb.shape[0], device=device, dtype=gb.dtype))
+        left = torch.linalg.solve_triangular(cholesky, gh, upper=False)
+        sym = torch.linalg.solve_triangular(cholesky, left.T, upper=False).T
+        reference = torch.linalg.eigvalsh((sym + sym.T) / 2)[-1]
+        exact_gradient = tree_detach(parameter_gradient(reference, parameters))
+        fd = centered_spectral_gradient(fh, fb, parameters, result.direction, mu=mu, center=result.center)
+        relative_eigen_error = float(((result.center.rho - reference) / reference).abs().detach())
+        relative_gradient_error = float(tree_norm(tree_sub(fd.gradient, exact_gradient)) / tree_norm(exact_gradient))
+        cosine = float(tree_cosine_similarity(fd.gradient, exact_gradient))
+        assert relative_eigen_error < 1e-8 and relative_gradient_error < 1e-5 and cosine > .999
+        d = result.diagnostics
+        report["variants"].append(dict(token_blocks=blocks, rho=float(d.rho_hat),
+            explicit_rho=float(reference.detach()), eigen_relative_error=relative_eigen_error,
+            relative_residual=float(d.relative_residual), b_norm=float(d.b_mu_norm),
+            damping_fraction=float(d.damping_fraction), eigengap=float(d.eigengap),
+            kernel_columns=d.kernel_columns, kernel_projection=float(d.kernel_projection),
+            fd_eigen_gradient_relative_error=relative_gradient_error, fd_eigen_gradient_cosine=cosine,
+            **timed(solve, device)))
+        del h_jac, b_jac, h, b, gh, gb, reference, exact_gradient, fd, result
+    report["interpretation"] = (
+        "Lower rho across token-block variants is partly a larger denominator by construction; "
+        "it is not evidence of better safety. Timings include only the dual solve."
+    )
+    return report
+
+
+def run_v5(device):
+    """Small numerical V5 qualification; dense matrices are diagnostic only."""
+    from src.cbg.spectral_grad import direct_spectral_gradient
+    from src.cbg.bounded import bounded_rayleigh_solve, compute_complement_enclosure
+    model, parameters, harmful, safe, benign = fixture(device)
+    mu = .0006359621327540446
+    report = dict(scope="FP64 toy V5 qualification, not a Llama performance result",
+                  torch=torch.__version__, device=str(device), mu=mu, variants=[])
+    for q in (1, 2):
+        fh = make_safety_functional(model, harmful, safe, chunk_size=1)
+        fb = make_benign_functional(model, benign, chunk_size=1, token_blocks=q)
+        r = dual_rayleigh_solve(fh, fb, parameters, mu=mu, tolerance=1e-8)
+        direct = direct_spectral_gradient(fh, fb, parameters, r.direction, mu=mu, center=r.center)
+        a = torch.cat([v.reshape(3, -1) for v in jacrev(fh)(parameters).values()], 1) / 3**.5
+        c = torch.cat([v.reshape(3*q, -1) for v in jacrev(fb)(parameters).values()], 1) / (3*q)**.5
+        chol = torch.linalg.cholesky(c.T@c + mu*torch.eye(c.shape[1], dtype=c.dtype, device=device))
+        w = torch.linalg.solve_triangular(chol, a.T, upper=False)
+        exact_rho = torch.linalg.eigvalsh(w.T @ w)[-1]
+        exact = parameter_gradient(exact_rho, parameters)
+        error = float(tree_norm(tree_sub(direct.gradient, exact))/tree_norm(exact))
+        assert error < 1e-8
+        variant = dict(q=q, rho=float(r.center.rho), b_norm=float(r.center.b.sqrt()),
+                       residual=float(r.diagnostics.relative_residual),
+                       direct_exact_relative_error=error, gradient_norm=float(tree_norm(direct.gradient)), fd=[])
+        for tau in (1e-5, 1e-4, 1e-3):
+            fd = centered_spectral_gradient(fh, fb, parameters, r.direction, mu=mu, center=r.center, tau_fd=tau)
+            cosine = float(tree_cosine_similarity(direct.gradient, fd.gradient))
+            relative = float(tree_norm(tree_sub(fd.gradient, direct.gradient))/tree_norm(direct.gradient))
+            assert cosine > .99999 and relative < 1e-4
+            variant["fd"].append(dict(tau=tau, cosine=cosine, relative_error=relative,
+                                      cancellation=float(fd.fd_cancellation)))
+        rr = bounded_rayleigh_solve(fh, fb, parameters, mu=mu,
+            generator=torch.Generator(device=device).manual_seed(19))
+        assert abs(float(rr.center.rho/r.center.rho)-1) < 1e-3
+        variant["bounded"] = dict(rho=float(rr.center.rho), fallback=rr.diagnostics.dual_fallback,
+            metric_evaluations=rr.diagnostics.metric_evaluations,
+            row_pullbacks=rr.diagnostics.safety_row_pullbacks)
+        report["variants"].append(variant)
+    p = OrderedDict(w=torch.zeros(2, dtype=torch.float64, device=device, requires_grad=True))
+    fh = lambda p: p["w"] * p["w"].new_tensor([2**.5, 200**.5])
+    fb = lambda p: p["w"] * 0
+    v = OrderedDict(w=p["w"].new_tensor([1., 0.]))
+    bound = compute_complement_enclosure(fh, fb, p, [v], mu=1.)
+    report["hidden_mode"] = dict(lower=float(bound.lower), upper=float(bound.upper), eta=float(bound.eta))
+    return report
 
 
 if __name__ == "__main__":

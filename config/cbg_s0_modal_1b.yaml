@@ -1,0 +1,108 @@
+# Feasible single-GPU S0 pilot. This preserves the exact FP32 CBG protocol
+# while using a <=3B model from the same Llama 3.2 family.
+schema_version: 1
+output_root: output/scenarios
+manifest: output/scenarios/splits.json
+models:
+  main: meta-llama/Llama-2-7b-chat-hf
+  pilot: meta-llama/Llama-3.2-1B-Instruct
+  additional:
+    - meta-llama/Llama-3.1-8B-Instruct
+    - Qwen/Qwen2.5-7B-Instruct
+seeds:
+  defense: [42, 43, 44]
+  attack: 2026
+  split: 2026
+  geometry: 31415
+data:
+  safety: data/beavertails_cbg_train.json
+  benign: data/alpaca_train.json
+  evaluation: data/beavertails_test.json
+  refusal_model: "meta-llama/Llama-2-7b-chat-hf; artifact=anonymous4486/repnoise_beavertail@11ea63756195527164a9aa2850f7544bd251eab1"
+  defense_size: 4000
+  benign_size: 4000
+  validation_size: 1000
+  attack_size: 10000
+  max_rows_per_prompt: 2
+  category_order: null
+search:
+  beta: null
+  alpha: null
+  kappa_mu: null
+  xi: null
+  relative_radius: null
+  max_zs_drop_pp: null
+  utility_subset_sha256: null
+defense:
+  learning_rate: 0.00002
+  max_steps: 500
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  optim: adamw_torch
+  kl_direction: reference_to_current
+  safety_batch_size: 8
+  benign_batch_size: 32
+  spectral_modes: 4
+  safety_max_length: 512
+  benign_max_length: 128
+  max_grad_norm: 1.0
+  save_steps: 100
+  # Keep the frozen reference model off the H100. Only its selected response
+  # logits are copied back to the training device.
+  reference_device: cpu
+pilot:
+  max_steps: 100
+  radii: [0.0001, 0.0003, 0.001, 0.003, 0.01, 0.03]
+  max_fd_relative_error: 0.05
+  max_alignment_growth: 0.10
+  max_benign_kl: 0.02
+attacks:
+  context_length: 512
+  benign_length: 128
+  max_grad_norm: null
+  benign_batch_size: 32
+  projection_rcond: null
+  kl_lambdas: null
+  reverse_cbg_betas: null
+  projected_counts: [32, 128]
+  rescale_sigmas: [0.5, 1.0]
+  lora_ranks: [8, 64]
+  long_attack_samples: null
+  noise_scale: null
+geometry:
+  batches: 8
+  save_steps: 25
+ablations:
+  xi_values: null
+  rayleigh_step_size: null
+restoration:
+  collapse_max_zs: null
+  warmup_ratio: null
+  weight_decay: null
+  max_grad_norm: null
+  scheduler: null
+evaluation:
+  max_new_tokens: null
+  classifier_model: domenicrosati/deberta-v3-xsmall-beavertails-harmful-qa-classifier
+  harmful_label: null
+  hs_reduction: null
+  classifier_threshold: 0.5
+  hs_g_judge: null
+  zs_tasks:
+    mmlu: acc,none
+    truthfulqa_mc2: acc,none
+    arc_easy: acc,none
+    hellaswag: acc_norm,none
+external:
+  seam: null
+  seam_er: null
+  vaccine: null
+  targeted_vaccine: null
+  booster: null
+  repnoise: null
+  tar: null
+  reverse_seam: null
+  orthogonalization: null
+  finetunability: null
+  overrefusal: null
+  seam_unlearning_ablation: null

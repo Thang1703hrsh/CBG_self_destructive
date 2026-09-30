@@ -1,0 +1,15 @@
+# Copy and fill AFTER producing checkpoints; no baseline is synthesized.
+# model is the original base-model ID, checkpoint is the defended model path.
+# Repeat SEAM/CBG entries for seeds 43 and 44 before claiming main comparisons.
+- model: meta-llama/Llama-2-7b-chat-hf
+  defense: base
+  seed: 0
+  checkpoint: meta-llama/Llama-2-7b-chat-hf
+- model: meta-llama/Llama-2-7b-chat-hf
+  defense: cbg
+  seed: 42
+  checkpoint: null
+- model: meta-llama/Llama-2-7b-chat-hf
+  defense: seam
+  seed: 42
+  checkpoint: null

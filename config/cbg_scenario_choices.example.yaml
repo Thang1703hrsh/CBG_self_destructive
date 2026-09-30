@@ -1,0 +1,8 @@
+# Copy to your pilot_choices.yaml and set these author decisions explicitly.
+# For radius measurement r is provisional; set it to the chosen radius before
+# materializing/training the 100-step pilot.
+alpha: null
+beta: null
+xi: null
+kappa_mu: null
+relative_radius: null

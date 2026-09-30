@@ -1,8 +1,8 @@
 """Hugging Face Trainer integration for Collateral Barrier Geometry.
 
 This module deliberately does not share the custom ``SeamTrainer`` inner
-loop.  CBG computes its gradient explicitly in the configured LoRA coordinate
-space, then hands that gradient back to the stock Transformers optimizer loop
+loop. CBG computes its gradient explicitly in the configured parameter space,
+then hands that gradient back to the stock Transformers optimizer loop
 through a zero-valued differentiable proxy.  Consequently optimizer stepping,
 gradient accumulation, clipping, AMP scaling, scheduler stepping, and ordinary
 Trainer checkpoint bookkeeping remain owned by :class:`transformers.Trainer`.
@@ -18,14 +18,14 @@ import os
 import time
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import Tensor, nn
-from transformers import Trainer
+from transformers import Trainer, TrainerCallback
 
 from src.cbg.functionals import (
     benign_preservation_loss,
@@ -36,22 +36,27 @@ from src.cbg.functionals import (
     sequence_chunks,
 )
 from src.cbg.rayleigh import calibrate_relative_damping, warm_started_rayleigh_ascent
+from src.cbg.dual import dual_rayleigh_solve
+from src.cbg.bounded import bounded_rayleigh_solve
 from src.cbg.spectral_grad import (
     centered_spectral_gradient,
-    compose_training_gradient,
+    direct_spectral_gradient,
+    compact_spectral_center,
     parameter_gradient,
     streamed_loss_gradient,
 )
 from src.cbg.tree_ops import (
     OrderedTensorTree,
     TensorTree,
+    accumulate_detached_gradient,
     select_admissible_parameters,
     select_lora_parameters,
     tree_clone,
     tree_detach,
     tree_norm,
-    tree_zeros_like,
+    tree_dot,
     tree_add,
+    tree_sub,
 )
 
 
@@ -59,12 +64,20 @@ logger = logging.getLogger(__name__)
 
 CBG_STATE_NAME = "cbg_state.pt"
 CBG_CONFIG_NAME = "cbg_config.json"
-CBG_STATE_VERSION = 2
+CBG_STATE_VERSION = 4
 
 _NON_RESUME_CONFIG_FIELDS = {
     "cbg_resume_from_checkpoint",
     "wandb_project_name",
     "wandb_run_name",
+}
+
+_SPEC_CONFIG_FIELDS = {
+    "safety_batch_size", "benign_batch_size", "safety_max_length", "benign_max_length",
+    "spectral_modes", "xi", "kappa_mu", "relative_radius", "gram_max_bytes",
+    "transformer_block_path", "kl_direction", "spec_damping", "fisher", "detach_lambda",
+    "num_sign_draws", "spec_objective", "drop_aln", "scenario_manifest",
+    "spec_solver", "spec_rayleigh_steps", "spec_rayleigh_step_size", "spec_perturb_precision",
 }
 
 
@@ -78,6 +91,7 @@ class CbgArguments:
 
     method: str = "cbg"
     model_name: str = "meta-llama/Llama-3.2-3B-Instruct"
+    model_revision: str | None = None
     tokenizer_name: str | None = None
     wandb_project_name: str = "cbg"
     wandb_run_name: str | None = None
@@ -92,6 +106,8 @@ class CbgArguments:
     context_length: int = 256
 
     # Admissible LoRA coordinates.
+    parameter_space: str = "lora"
+    reference_device: str | None = None
     lora_rank: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.0
@@ -103,6 +119,60 @@ class CbgArguments:
     functional_chunk_size: int = 0
     preservation_chunk_size: int = 0
     cbg_attention_implementation: str = "eager"
+    # Defaults retain the previous geometry and solver for reproducibility.
+    benign_token_blocks: int = 1
+    geometry_solver: str = "ascent"
+    # Legacy defaults keep archived YAMLs reproducible. The V5 configuration
+    # explicitly selects v5 + direct_rof + dual (or bounded_ritz).
+    cbg_version: str = "v2"
+    # Authoritative implementation-spec path; v2/v5 remain reproducible.
+    safety_batch_size: int = 8
+    benign_batch_size: int = 32
+    safety_max_length: int = 513
+    benign_max_length: int = 128
+    spectral_modes: int = 4
+    xi: float | None = None
+    kappa_mu: float | None = None
+    relative_radius: float | None = None
+    gram_max_bytes: int = 67108864
+    transformer_block_path: str = "model.layers"
+    kl_direction: str = "reference_to_current"
+    spec_damping: str = "relative"
+    fisher: str = "sampled"
+    detach_lambda: bool = False
+    num_sign_draws: int = 1
+    spec_objective: str = "log_eta"
+    drop_aln: bool = False
+    scenario_manifest: str | None = None
+    spec_solver: str = "exact"
+    spec_rayleigh_steps: int = 0
+    spec_rayleigh_step_size: float | None = None
+    spec_perturb_precision: str = "fp32"
+    spectral_derivative_backend: str = "centered_fd"
+    # Research-only escape hatch for a guarded full-parameter feasibility
+    # probe. Production V5 remains FP32 unless this is explicitly enabled.
+    experimental_bf16_geometry: bool = False
+    ritz_initial_size: int = 2
+    ritz_max_size: int = 6
+    ritz_max_enrichments: int = 4
+    ritz_residual_tolerance: float = 1e-4
+    ritz_orthogonality_tolerance: float = 1e-5
+    enclosure_atol: float = 1e-6
+    enclosure_rtol: float = 1e-3
+    enclosure_rho_scale: float = 1.0
+    dual_max_size: int = 64
+    dual_tolerance: float = 1e-4
+    # Kept separate from value/kernel tolerances because full parameter-space
+    # VJP/JVP residuals have a model- and precision-dependent numerical floor.
+    dual_residual_tolerance: float = 1e-4
+    dual_kernel_tolerance: float = 1e-5
+    dual_column_batch_size: int = 1
+    dual_refinement_steps: int = 0
+    dual_column_fallback: bool = False
+    # A rare, slower retry for FP32 verification outliers. It rebuilds the
+    # identical finite-batch maps with scalar functional chunks and evaluates
+    # sequential kernel columns; it never relaxes a gate or changes mu/data.
+    dual_functional_chunk_fallback: bool = False
 
     # Weakest-escape search and damping.
     inner_steps: int = 2
@@ -149,12 +219,68 @@ class CbgArguments:
             raise ValueError(
                 "reference_mode must be 'disabled_adapter' or 'separate_model'"
             )
+        if self.parameter_space not in {"lora", "full"}:
+            raise ValueError("parameter_space must be 'lora' or 'full'")
+        if self.parameter_space == "full" and self.reference_mode != "separate_model":
+            raise ValueError("full-parameter CBG requires reference_mode='separate_model'")
+        if not isinstance(self.experimental_bf16_geometry, bool):
+            raise ValueError("experimental_bf16_geometry must be boolean")
         if self.damping_mode not in {"absolute", "relative"}:
             raise ValueError("damping_mode must be 'absolute' or 'relative'")
         if self.beta_mode not in {"fixed", "grad_ratio"}:
             raise ValueError("beta_mode must be 'fixed' or 'grad_ratio'")
         if self.inner_policy not in {"fixed", "adaptive"}:
             raise ValueError("inner_policy must be 'fixed' or 'adaptive'")
+        if self.geometry_solver not in {"ascent", "dual", "bounded_ritz", "exact"}:
+            raise ValueError("geometry_solver must be ascent, dual, bounded_ritz or exact")
+        if self.experimental_bf16_geometry and (
+            self.parameter_space != "full" or self.geometry_solver != "dual"
+        ):
+            raise ValueError(
+                "experimental_bf16_geometry is restricted to full-parameter dual probes"
+            )
+        if self.cbg_version not in {"v2", "v5", "spec"}:
+            raise ValueError("cbg_version must be v2, v5 or spec")
+        if self.scenario_manifest and self.cbg_version != "spec":
+            raise ValueError("scenario_manifest requires cbg_version=spec")
+        if self.cbg_version == "spec":
+            if (self.parameter_space != "full" or self.geometry_solver != "exact"
+                or self.spectral_derivative_backend != "centered_fd" or self.beta_mode != "fixed"
+                or self.experimental_bf16_geometry or self.damping_mode != "relative"):
+                raise ValueError("spec CBG requires full parameters, exact solve, centered_fd, fixed beta and relative mu")
+            for name in ("safety_batch_size", "benign_batch_size"):
+                _require_int_at_least(getattr(self, name), 1, name)
+            for name in ("safety_max_length", "benign_max_length"):
+                _require_int_at_least(getattr(self, name), 2, name)
+            if self.spectral_modes > self.safety_batch_size:
+                raise ValueError("spectral_modes cannot exceed safety_batch_size")
+            self.spec_config()
+        elif self.geometry_solver == "exact":
+            raise ValueError("geometry_solver=exact belongs to cbg_version=spec")
+        if self.spectral_derivative_backend not in {"centered_fd", "direct_rof"}:
+            raise ValueError("spectral_derivative_backend must be centered_fd or direct_rof")
+        if self.cbg_version == "v5" and (
+            self.spectral_derivative_backend != "direct_rof" or self.geometry_solver == "ascent"
+        ):
+            raise ValueError("V5 requires direct_rof and a verified dual or bounded_ritz solve")
+        _require_int_at_least(self.ritz_initial_size, 1, "ritz_initial_size")
+        _require_int_at_least(self.ritz_max_size, max(2, self.ritz_initial_size), "ritz_max_size")
+        _require_int_at_least(self.ritz_max_enrichments, 0, "ritz_max_enrichments")
+        for name in ("ritz_residual_tolerance", "ritz_orthogonality_tolerance", "enclosure_rho_scale"):
+            _require_positive(getattr(self, name), name)
+        for name in ("enclosure_atol", "enclosure_rtol"):
+            _require_nonnegative(getattr(self, name), name)
+        _require_int_at_least(self.benign_token_blocks, 1, "benign_token_blocks")
+        _require_int_at_least(self.dual_max_size, 1, "dual_max_size")
+        _require_int_at_least(self.dual_column_batch_size, 1, "dual_column_batch_size")
+        _require_int_at_least(self.dual_refinement_steps, 0, "dual_refinement_steps")
+        if not isinstance(self.dual_column_fallback, bool):
+            raise ValueError("dual_column_fallback must be boolean")
+        if not isinstance(self.dual_functional_chunk_fallback, bool):
+            raise ValueError("dual_functional_chunk_fallback must be boolean")
+        _require_positive(self.dual_tolerance, "dual_tolerance")
+        _require_positive(self.dual_residual_tolerance, "dual_residual_tolerance")
+        _require_positive(self.dual_kernel_tolerance, "dual_kernel_tolerance")
         if self.cbg_attention_implementation != "eager":
             raise ValueError("the validated CBG attention baseline is 'eager'; validate JVP kernels before changing it")
         if self.lora_bias != "none":
@@ -213,6 +339,19 @@ class CbgArguments:
             )
 
 
+    def spec_config(self):
+        from src.cbg.spec import SpecConfig
+        return SpecConfig(xi=self.xi, kappa_mu=self.kappa_mu, r=self.relative_radius,
+                          alpha=self.alpha, beta=self.beta, k=self.spectral_modes,
+                          gram_max_bytes=self.gram_max_bytes, block_path=self.transformer_block_path,
+                          kl_direction=self.kl_direction, damping=self.spec_damping,
+                          fisher=self.fisher, detach_lambda=self.detach_lambda,
+                          num_sign_draws=self.num_sign_draws, objective=self.spec_objective,
+                          drop_aln=self.drop_aln, solver=self.spec_solver,
+                          rayleigh_steps=self.spec_rayleigh_steps, rayleigh_step_size=self.spec_rayleigh_step_size,
+                          perturb_precision=self.spec_perturb_precision)
+
+
 def _require_int_at_least(value: int, minimum: int, name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{name} must be an integer >= {minimum}")
@@ -257,6 +396,12 @@ def _canonical_config(config: Mapping[str, Any]) -> dict[str, Any]:
     comparable = {
         key: value for key, value in config.items() if key not in _NON_RESUME_CONFIG_FIELDS
     }
+    if comparable.get("model_revision") is None:
+        comparable.pop("model_revision", None)
+    if comparable.get("cbg_version", "v2") != "spec":
+        # New spec-only fields have no effect on legacy experiments. Preserve
+        # fingerprints of their existing version-4 checkpoints.
+        comparable = {key: value for key, value in comparable.items() if key not in _SPEC_CONFIG_FIELDS}
     # The round trip canonicalizes tuples to lists and rejects values that
     # cannot be represented in the human-readable checkpoint configuration.
     return json.loads(json.dumps(comparable, sort_keys=True))
@@ -267,8 +412,55 @@ def _config_fingerprint(config: Mapping[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+class _OptimizerStepMetrics(TrainerCallback):
+    """Measure the actual adapter update around Trainer's optimizer step.
+
+    One temporary detached parameter tree is retained only across that step.
+    These are actual updates, not an attribution of Adam's nonlinear scaling.
+    """
+    def __init__(self, trainer):
+        self.trainer = trainer
+        self.before = None
+        self.measure_update = trainer.cbg_args.parameter_space != "full"
+
+    def on_pre_optimizer_step(self, args, state, control, model=None, optimizer=None, **kwargs):
+        self.started = time.perf_counter()
+        # A full-parameter snapshot is ~12.3 GB for Qwen2.5-3B FP32 and is a
+        # diagnostic, not part of CBG. Keep exact update norms for LoRA but do
+        # not jeopardize full-parameter training merely to report this scalar.
+        if self.measure_update:
+            self.before = tree_clone(tree_detach(self.trainer._admissible_parameters(model)))
+        # Some Trainer versions leave CallbackHandler.optimizer unset when
+        # the optimizer is attached after construction. Read the live Trainer
+        # optimizer rather than losing the applied (pre-scheduler) LR metric.
+        if optimizer is None:
+            optimizer = getattr(self.trainer, "optimizer", None)
+        self.step_lr = float(optimizer.param_groups[0]["lr"]) if optimizer is not None else None
+
+    def on_optimizer_step(self, args, state, control, model=None, **kwargs):
+        current = self.trainer._admissible_parameters(model)
+        metrics = {}
+        if self.measure_update:
+            if self.before is None:
+                raise RuntimeError("missing pre-optimizer snapshot for CBG update diagnostics")
+            with torch.no_grad():
+                metrics["train/optimizer_step_norm"] = tree_norm(tree_sub(current, self.before))
+            self.before = None
+        if self.step_lr is not None:
+            metrics["train/optimizer_lr_used"] = self.step_lr
+        device = next(iter(current.values())).device
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            metrics.update({
+                "system/max_memory_allocated": torch.cuda.max_memory_allocated(device),
+                "system/max_memory_reserved": torch.cuda.max_memory_reserved(device),
+            })
+        metrics["system/optimizer_step_time"] = time.perf_counter() - self.started
+        self.trainer._record_metrics(metrics)
+
+
 class CbgTrainer(Trainer):
-    """Trainer that applies the complete LoRA-space CBG defense gradient."""
+    """Trainer for legacy LoRA/full-space and implementation-spec CBG gradients."""
 
     def __init__(
         self,
@@ -282,6 +474,7 @@ class CbgTrainer(Trainer):
         self.reference_model = reference_model
         self.data_manifest = dict(data_manifest) if data_manifest is not None else None
         self.prev_u: OrderedTensorTree | None = None
+        self.prev_basis: tuple[OrderedTensorTree, ...] = ()
         self.calibrated_mu: float | None = None
         self._beta_candidate_sum = 0.0
         self._beta_candidate_count = 0
@@ -292,35 +485,49 @@ class CbgTrainer(Trainer):
         self._loaded_cbg_checkpoint: str | None = None
 
         super().__init__(*args, **kwargs)
+        if self.cbg_args.cbg_version == "v5":
+            self.add_callback(_OptimizerStepMetrics(self))
         # Our training_step consumes and scales its own explicit gradient.  It
         # never passes num_items_in_batch through to the language model.
         self.model_accepts_loss_kwargs = False
 
         self._validate_runtime()
         functional_model = self.accelerator.unwrap_model(self.model)
-        admissible = select_lora_parameters(
-            functional_model,
-            target_modules=self.cbg_args.lora_target_modules,
-            trainable_only=True,
-        )
+        if self.cbg_args.parameter_space == "lora":
+            admissible = select_lora_parameters(
+                functional_model,
+                target_modules=self.cbg_args.lora_target_modules,
+                trainable_only=True,
+            )
+        elif self.cbg_args.cbg_version == "spec":
+            from src.cbg.spec_hooks import spec_linear_modules
+            admissible = OrderedDict((name, module.weight) for name, module in
+                spec_linear_modules(functional_model, self.cbg_args.transformer_block_path).items())
+        else:
+            admissible = select_admissible_parameters(functional_model, trainable_only=True)
         self._admissible_names = tuple(admissible)
         all_trainable = tuple(
             name for name, parameter in functional_model.named_parameters() if parameter.requires_grad
         )
-        if set(all_trainable) != set(self._admissible_names):
+        if self.cbg_args.cbg_version != "spec" and set(all_trainable) != set(self._admissible_names):
             unexpected = sorted(set(all_trainable) - set(self._admissible_names))
             missing = sorted(set(self._admissible_names) - set(all_trainable))
             raise ValueError(
-                "CBG requires every and only configured LoRA coordinates to be trainable; "
+                "CBG requires every and only configured admissible coordinates to be trainable; "
                 f"unexpected={unexpected}, missing={missing}"
             )
+        admissible_dtypes = (
+            (torch.bfloat16, torch.float32, torch.float64)
+            if self.cbg_args.experimental_bf16_geometry
+            else (torch.float32, torch.float64)
+        )
         non_fp32 = [
             name
             for name, parameter in admissible.items()
-            if parameter.dtype not in (torch.float32, torch.float64)
+            if parameter.dtype not in admissible_dtypes
         ]
         if non_fp32:
-            raise ValueError(f"CBG needs FP32/FP64 adapter leaves for finite differences: {non_fp32}")
+            raise ValueError(f"CBG has unsupported admissible leaf dtypes: {non_fp32}")
         if getattr(getattr(functional_model, "config", None), "use_cache", False):
             functional_model.config.use_cache = False
 
@@ -341,13 +548,31 @@ class CbgTrainer(Trainer):
             reference_model.requires_grad_(False)
             reference_model.eval()
             try:
-                reference_model.to(self.args.device)
+                reference_device = self.cbg_args.reference_device or str(self.args.device)
+                reference_model.to(torch.device(reference_device))
+                self._reference_device = torch.device(reference_device)
             except (RuntimeError, ValueError) as error:
                 raise ValueError(
                     "the separate reference model could not be moved to the Trainer device"
                 ) from error
 
     def _validate_runtime(self) -> None:
+        if self.cbg_args.cbg_version == "spec":
+            if self.args.bf16 or self.args.fp16 or self.args.tf32:
+                raise ValueError("spec CBG requires bf16=False, fp16=False, tf32=False")
+            if self.args.per_device_train_batch_size != 1:
+                raise ValueError("spec dataset items are joint batches: per_device_train_batch_size must be 1")
+        low_precision = self.args.bf16 or self.args.fp16
+        experimental_bf16 = (
+            self.cbg_args.experimental_bf16_geometry
+            and self.cbg_args.parameter_space == "full"
+            and self.cbg_args.geometry_solver == "dual"
+            and self.args.bf16
+            and not self.args.fp16
+        )
+        if (self.cbg_args.geometry_solver in {"dual", "bounded_ritz"}
+            or self.cbg_args.spectral_derivative_backend == "direct_rof") and low_precision and not experimental_bf16:
+            raise ValueError("dual geometry currently requires FP32 forwards: set bf16=False and fp16=False")
         if self.cbg_args.method != "cbg":
             raise ValueError("CbgTrainer requires method='cbg'")
         if self.args.save_only_model:
@@ -399,8 +624,25 @@ class CbgTrainer(Trainer):
                 return select_response_logits(_extract_logits(reference(**kwargs)), benign_batch).detach()
 
         assert self.reference_model is not None
-        with torch.no_grad():
-            return select_response_logits(_extract_logits(self.reference_model(**kwargs)), benign_batch).detach()
+        from src.cbg.spec import spec_precision
+        precision = (spec_precision(self.reference_model)
+                     if self.cbg_args.cbg_version == "spec" else nullcontext())
+        with precision, torch.no_grad():
+            reference_device = getattr(self, "_reference_device", self.args.device)
+            reference_batch = {
+                name: value.to(reference_device) if isinstance(value, Tensor) else value
+                for name, value in benign_batch.items()
+            }
+            reference_kwargs = {
+                "input_ids": reference_batch["input_ids"],
+                "attention_mask": reference_batch.get("attention_mask"),
+            }
+            logits = _extract_logits(self.reference_model(**reference_kwargs))
+            # Keep selected logits on the reference device. The spec loss
+            # moves them only while evaluating an endpoint, so the large
+            # vocabulary tensor does not occupy GPU memory during the center
+            # forward/backward passes.
+            return select_response_logits(logits, reference_batch).detach()
 
     def _preservation_gradients(self, model, parameters, safe_batch, benign_batch):
         functional_model = self.accelerator.unwrap_model(model)
@@ -435,7 +677,7 @@ class CbgTrainer(Trainer):
                 num_directions=self.cbg_args.damping_calibration_directions,
                 mu_floor=self.cbg_args.mu_floor,
             )
-            value = float(calibrated.float().item())
+            value = float(calibrated.item())
         _require_positive(value, "calibrated_mu")
         self.calibrated_mu = value
         return value
@@ -496,6 +738,68 @@ class CbgTrainer(Trainer):
             self.cbg_args.beta_mode == "fixed" and self.cbg_args.beta == 0.0
         )
 
+    def _search_geometry(self, safety, benign, parameters, **kwargs):
+        if self.cbg_args.geometry_solver == "bounded_ritz":
+            args = self.cbg_args
+            return bounded_rayleigh_solve(
+                safety, benign, parameters, mu=kwargs["mu"], warm_start=kwargs["warm_start"],
+                warm_basis=getattr(self, "prev_basis", ()), initial_size=args.ritz_initial_size,
+                max_size=args.ritz_max_size, max_enrichments=args.ritz_max_enrichments,
+                residual_tolerance=args.ritz_residual_tolerance,
+                orthogonality_tolerance=args.ritz_orthogonality_tolerance,
+                enclosure_atol=args.enclosure_atol, enclosure_rtol=args.enclosure_rtol,
+                rho_scale=args.enclosure_rho_scale, dual_max_size=args.dual_max_size,
+                dual_tolerance=args.dual_tolerance, dual_kernel_tolerance=args.dual_kernel_tolerance,
+                dual_residual_tolerance=args.dual_residual_tolerance,
+                dual_column_batch_size=args.dual_column_batch_size,
+                dual_refinement_steps=args.dual_refinement_steps,
+            )
+        if self.cbg_args.geometry_solver == "dual":
+            configured_width = kwargs.get(
+                "dual_column_batch_size", self.cbg_args.dual_column_batch_size
+            )
+            allow_width_fallback = kwargs.get(
+                "dual_column_fallback", self.cbg_args.dual_column_fallback
+            )
+            width = configured_width
+            while True:
+                try:
+                    result = dual_rayleigh_solve(
+                        safety, benign, parameters, mu=kwargs["mu"], warm_start=kwargs["warm_start"],
+                        max_size=self.cbg_args.dual_max_size, tolerance=self.cbg_args.dual_tolerance,
+                        kernel_tolerance=self.cbg_args.dual_kernel_tolerance,
+                        residual_tolerance=self.cbg_args.dual_residual_tolerance,
+                        column_batch_size=width,
+                        refinement_steps=self.cbg_args.dual_refinement_steps,
+                        allow_bf16=self.cbg_args.experimental_bf16_geometry,
+                    )
+                    self._effective_dual_column_width = width
+                    self._dual_column_fallbacks = int(width != self.cbg_args.dual_column_batch_size)
+                    return result
+                except FloatingPointError as error:
+                    # Column batching changes only execution order, so a
+                    # narrower recomputation targets exactly the same sample
+                    # kernel/eigenproblem. Retry only independent residual
+                    # verification failures; never mask nonfinite, asymmetric,
+                    # non-PSD, projection, or normalization failures.
+                    retryable = str(error).startswith(
+                        "dual reconstruction failed independent verification:"
+                    )
+                    if (not allow_width_fallback or not retryable or width == 1):
+                        raise
+                    # Retry at the largest lower power-of-two width.  Plain
+                    # integer halving incorrectly skipped width 2 for an odd
+                    # configured width (3 -> 1), removing a materially
+                    # different reduction order before the slow scalar path.
+                    # This gives 8->4->2->1, 4->2->1, and 3->2->1.
+                    next_width = 1 << ((width - 1).bit_length() - 1)
+                    logger.warning(
+                        "dual width %d missed verification; recomputing the same V5 operator at width %d",
+                        width, next_width,
+                    )
+                    width = next_width
+        return warm_started_rayleigh_ascent(safety, benign, parameters, **kwargs)
+
     def _backward_explicit_gradient(
         self,
         parameters: TensorTree,
@@ -532,6 +836,8 @@ class CbgTrainer(Trainer):
         """Compute one complete CBG microbatch gradient at the current center."""
 
         del num_items_in_batch
+        if self.cbg_args.cbg_version == "spec":
+            return self._spec_training_step(model, inputs)
         step_started = time.perf_counter()
         memory_device: torch.device | None = None
         if torch.cuda.is_available() and self.args.device.type == "cuda":
@@ -550,6 +856,24 @@ class CbgTrainer(Trainer):
         safe_batch = prepared["safe"]
         benign_batch = prepared["benign"]
         preservation_only = not self._should_compute_geometry()
+        zero_safety = False
+        diagnostics = None
+        warm_basis: tuple[OrderedTensorTree, ...] = ()
+        spectral_gradient = None
+        spectral_backend = "disabled"
+        spectral_terms = 0
+        spectral_delta = None
+        spectral_cancellation = None
+        center_rho = center_qh = center_qb = center_b = None
+        phase_times = dict(geometry=0., spectral=0., preservation=0.)
+        self._effective_dual_column_width = 0
+        self._dual_column_fallbacks = 0
+        self._effective_functional_chunk_size = 0
+        self._functional_chunk_fallbacks = 0
+        def phase_clock():
+            if memory_device is not None:
+                torch.cuda.synchronize(memory_device)
+            return time.perf_counter()
 
         # A fixed deterministic map is essential for reusing metric products.
         # Disable stochastic layers for all CBG evaluations, without disabling
@@ -559,6 +883,9 @@ class CbgTrainer(Trainer):
             dtype=torch.bfloat16, cache_enabled=False,
         ):
             if not preservation_only:
+                phase_start = phase_clock()
+                self._effective_functional_chunk_size = self.cbg_args.functional_chunk_size
+                self._functional_chunk_fallbacks = 0
                 safety_functional = make_safety_functional(
                     functional_model,
                     harmful_batch,
@@ -569,6 +896,7 @@ class CbgTrainer(Trainer):
                     functional_model,
                     benign_batch,
                     chunk_size=self.cbg_args.functional_chunk_size,
+                    token_blocks=self.cbg_args.benign_token_blocks,
                 )
                 mu = self._resolve_mu(benign_functional, parameters)
 
@@ -577,10 +905,7 @@ class CbgTrainer(Trainer):
                     self.cbg_args.inner_initial_steps if adaptive and self.prev_u is None
                     else self.cbg_args.inner_steps
                 )
-                rayleigh = warm_started_rayleigh_ascent(
-                    safety_functional,
-                    benign_functional,
-                    parameters,
+                search_options = dict(
                     mu=mu,
                     inner_steps=minimum_steps,
                     inner_lr=self.cbg_args.inner_lr,
@@ -591,8 +916,55 @@ class CbgTrainer(Trainer):
                     rayleigh_tolerance=self.cbg_args.inner_rayleigh_tolerance,
                     max_backtracks=self.cbg_args.inner_max_backtracks if adaptive else 0,
                 )
+                retry_scalar = False
+                try:
+                    rayleigh = self._search_geometry(
+                        safety_functional, benign_functional, parameters, **search_options
+                    )
+                except FloatingPointError as error:
+                    retryable = str(error).startswith(
+                        "dual reconstruction failed independent verification:"
+                    )
+                    can_retry_scalar = (
+                        self.cbg_args.geometry_solver == "dual"
+                        and self.cbg_args.dual_functional_chunk_fallback
+                        and self.cbg_args.functional_chunk_size != 1
+                        and retryable
+                    )
+                    if not can_retry_scalar:
+                        raise
+                    logger.warning(
+                        "dual verification failed after column-width retries; "
+                        "recomputing the same V5 operator with functional chunk 1 and dual width 1: %s",
+                        error,
+                    )
+                    retry_scalar = True
+                # Leave the exception handler BEFORE allocating retry graphs:
+                # its traceback retains failed solver frames and tensor trees.
+                if retry_scalar:
+                    # Functional chunking changes execution order only. Rebuild
+                    # both maps so the accepted direction and direct derivative
+                    # use exactly the same scalar-streamed operator.
+                    del safety_functional, benign_functional
+                    safety_functional = make_safety_functional(
+                        functional_model, harmful_batch, safe_batch, chunk_size=1
+                    )
+                    benign_functional = make_benign_functional(
+                        functional_model, benign_batch, chunk_size=1,
+                        token_blocks=self.cbg_args.benign_token_blocks,
+                    )
+                    self._effective_functional_chunk_size = 1
+                    self._functional_chunk_fallbacks = 1
+                    rayleigh = self._search_geometry(
+                        safety_functional,
+                        benign_functional,
+                        parameters,
+                        dual_column_batch_size=1,
+                        dual_column_fallback=False,
+                        **search_options,
+                    )
                 if not rayleigh.diagnostics.converged:
-                    if self.cbg_args.inner_fail_on_nonconvergence:
+                    if self.cbg_args.inner_fail_on_nonconvergence or self.cbg_args.cbg_version == "v5":
                         diagnostic = rayleigh.diagnostics
                         raise RuntimeError(
                             "CBG inner search did not converge; no outer update applied. "
@@ -605,59 +977,86 @@ class CbgTrainer(Trainer):
                     if self.state.global_step == 0:
                         logger.warning("CBG search is not converged; rho_hat is a directional estimate, not a dominant eigenvalue")
                 direction = tree_detach(rayleigh.direction)
-
-                spectral = centered_spectral_gradient(
-                    safety_functional,
-                    benign_functional,
-                    parameters,
-                    direction,
-                    mu=mu,
-                    tau_fd=self.cbg_args.tau_fd,
-                    theta_floor=self.cbg_args.theta_floor,
-                    u_floor=self.cbg_args.u_floor,
-                    same_randomness=True,
-                    center=rayleigh.center,
-                    retain_endpoint_gradients=False,
-                )
+                diagnostics = rayleigh.diagnostics
+                warm_basis = rayleigh.warm_basis
+                phase_times["geometry"] = phase_clock() - phase_start
+                zero_safety = diagnostics.zero_safety
+                if zero_safety:
+                    preservation_only = True
+                    del rayleigh, direction
+                else:
+                    phase_start = phase_clock()
+                    outer_center = compact_spectral_center(rayleigh.center)
+                    # Only u, frozen small coefficients and scalar diagnostics
+                    # are needed by either outer derivative. Release G_h u,
+                    # G_b u and B u BEFORE allocating its higher-order graph.
+                    del rayleigh
+                    derivative = (direct_spectral_gradient if self.cbg_args.spectral_derivative_backend == "direct_rof"
+                                  else centered_spectral_gradient)
+                    fd_options = {} if derivative is direct_spectral_gradient else dict(
+                        tau_fd=self.cbg_args.tau_fd, theta_floor=self.cbg_args.theta_floor,
+                        u_floor=self.cbg_args.u_floor, same_randomness=True, retain_endpoint_gradients=False,
+                    )
+                    spectral = derivative(
+                        safety_functional,
+                        benign_functional,
+                        parameters,
+                        direction,
+                        mu=mu,
+                        center=outer_center,
+                        **fd_options,
+                    )
+                    spectral_gradient = spectral.gradient
+                    spectral_backend = spectral.backend
+                    spectral_terms = spectral.terms_evaluated
+                    spectral_delta = spectral.delta
+                    spectral_cancellation = spectral.fd_cancellation
+                    center_rho = spectral.center.rho.detach()
+                    center_qh = spectral.center.qh.detach()
+                    center_qb = spectral.center.qb.detach()
+                    center_b = spectral.center.b.detach()
+                    # The full center owns four parameter-sized trees.  The
+                    # outer gradient and scalar diagnostics are sufficient
+                    # after direct differentiation, so release those products
+                    # before constructing preservation gradients.
+                    del spectral, outer_center
+                    phase_times["spectral"] = phase_clock() - phase_start
 
             # Preservation losses are deliberately distinct from the two
             # functional metrics used above.
+            phase_start = phase_clock()
             alignment_loss, alignment_gradient, benign_loss, benign_gradient = self._preservation_gradients(
                 model, parameters, safe_batch, benign_batch,
             )
+            phase_times["preservation"] = phase_clock() - phase_start
 
+        alignment_norm = tree_norm(alignment_gradient)
+        benign_norm = tree_norm(benign_gradient)
+        # Both loss streams return private detached accumulators. Reuse the
+        # alignment tree for the composed gradient rather than retaining two
+        # additional P-sized trees. This is algebraically the same axpy sum.
+        training_gradient = accumulate_detached_gradient(
+            alignment_gradient, benign_gradient, alpha=self.cbg_args.alpha,
+        )
+        preservation_norm = tree_norm(training_gradient)
+        del alignment_gradient, benign_gradient
+        spectral_dot_preservation = preservation_norm.new_zeros(())
         if preservation_only:
-            spectral_gradient = tree_zeros_like(parameters)
             effective_beta = 0.0
-            training_gradient = compose_training_gradient(
-                alignment_gradient,
-                benign_gradient,
-                spectral_gradient,
-                alpha=self.cbg_args.alpha,
-                beta=0.0,
-            )
+            cbg_norm = preservation_norm.new_zeros(())
         else:
-            spectral_gradient = spectral.gradient
-            preservation_gradient = compose_training_gradient(
-                alignment_gradient,
-                benign_gradient,
-                spectral_gradient,
-                alpha=self.cbg_args.alpha,
-                beta=0.0,
-            )
-            effective_beta = self._effective_beta(
-                preservation_gradient,
-                spectral_gradient,
-            )
-            training_gradient = (
-                preservation_gradient if effective_beta == 0 else
-                tree_add(preservation_gradient, spectral_gradient, alpha=effective_beta)
-            )
-
-        preservation_norm = tree_norm(tree_add(alignment_gradient, benign_gradient, alpha=self.cbg_args.alpha))
-        cbg_norm = tree_norm(spectral_gradient)
+            assert spectral_gradient is not None
+            cbg_norm = tree_norm(spectral_gradient)
+            effective_beta = self._effective_beta(training_gradient, spectral_gradient)
+            spectral_dot_preservation = tree_dot(training_gradient, spectral_gradient)
+            if effective_beta != 0:
+                accumulate_detached_gradient(
+                    training_gradient, spectral_gradient, alpha=effective_beta,
+                )
+            del spectral_gradient
         # Check before backward so a numerical failure cannot poison optimizer state.
-        if not bool(torch.isfinite(tree_norm(training_gradient))):
+        composed_norm = tree_norm(training_gradient)
+        if not bool(torch.isfinite(composed_norm)):
             raise FloatingPointError("non-finite composed CBG gradient")
 
         divisor = self._gradient_accumulation_divisor()
@@ -666,11 +1065,19 @@ class CbgTrainer(Trainer):
             training_gradient,
             divisor=divisor,
         )
+        # Explicit backward has copied the composed gradient into live
+        # parameter .grad buffers; release the detached construction trees
+        # before AdamW materializes its state.
+        del training_gradient
 
         # A failed spectral or preservation computation never changes the warm
         # start.  Persist only a direction from a fully successful backward.
         if not preservation_only:
             self.prev_u = tree_detach(direction)
+            self.prev_basis = tuple(tree_detach(v) for v in warm_basis)
+        elif zero_safety:
+            self.prev_u = None
+            self.prev_basis = ()
 
         if memory_device is not None:
             # Most geometry diagnostics already synchronize, but the final
@@ -679,14 +1086,23 @@ class CbgTrainer(Trainer):
         metrics: dict[str, float | Tensor] = {
             "train/l_aln": alignment_loss.detach(),
             "train/l_bgn": benign_loss.detach(),
-            "train/grad_norm_aln": tree_norm(alignment_gradient),
-            "train/grad_norm_bgn": tree_norm(benign_gradient),
+            "train/grad_norm_aln": alignment_norm,
+            "train/grad_norm_bgn": benign_norm,
             "train/grad_norm_cbg": cbg_norm,
-            "train/grad_norm_alpha_bgn": self.cbg_args.alpha * tree_norm(benign_gradient),
+            "train/grad_norm_alpha_bgn": self.cbg_args.alpha * benign_norm,
             "train/grad_norm_beta_cbg": effective_beta * cbg_norm,
             "train/grad_norm_preservation": preservation_norm,
+            # These are per-microbatch diagnostics BEFORE Trainer accumulation
+            # and clipping. Trainer's grad_norm measures the actual accumulated
+            # pre-clip norm at the optimizer boundary.
+            "train/grad_norm_composed": composed_norm,
+            "train/cbg_preservation_cosine": (
+                spectral_dot_preservation / (cbg_norm * preservation_norm).clamp_min(1e-30)
+            ).clamp(-1., 1.),
             "train/cbg_preservation_ratio": effective_beta * cbg_norm / preservation_norm.clamp_min(1e-12),
-            "cbg/enabled": float(not preservation_only),
+            "cbg/enabled": float(self._should_compute_geometry()),
+            "cbg/zero_safety": float(zero_safety),
+            "cbg/direct_rof": float(not preservation_only and spectral_backend == "direct_rof"),
             "train/beta_effective": effective_beta,
             "system/step_time": time.perf_counter() - step_started,
             "system/max_memory_allocated": (
@@ -694,6 +1110,7 @@ class CbgTrainer(Trainer):
                 if memory_device is not None
                 else 0.0
             ),
+            "system/max_memory_reserved": float(torch.cuda.max_memory_reserved(memory_device)) if memory_device is not None else 0.,
         }
         if preservation_only:
             # These finite zeros explicitly mean that the corresponding CBG
@@ -715,39 +1132,103 @@ class CbgTrainer(Trainer):
                 }
             )
         else:
-            rayleigh_values = rayleigh.diagnostics.rayleigh_values
+            assert diagnostics is not None
+            assert center_rho is not None and center_qh is not None and center_qb is not None and center_b is not None
+            rayleigh_values = diagnostics.rayleigh_values
             metrics.update(
                 {
-                    "train/rho_hat": spectral.center.rho,
-                    "train/qh_u": spectral.center.qh,
-                    "train/qb_u": spectral.center.qb,
-                    "train/qb_damped_u": spectral.center.b,
+                    "train/rho_hat": center_rho,
+                    "train/qh_u": center_qh,
+                    "train/qb_u": center_qb,
+                    "train/qb_damped_u": center_b,
                     "cbg/mu": mu,
-                    "cbg/delta": spectral.delta,
-                    "cbg/u_norm": rayleigh.diagnostics.u_euclidean_norm,
-                    "cbg/b_norm": rayleigh.diagnostics.b_mu_norm,
-                    "cbg/eig_residual": rayleigh.diagnostics.eig_residual_norm,
-                    "cbg/relative_residual": rayleigh.diagnostics.relative_residual,
-                    "cbg/converged": float(rayleigh.diagnostics.converged),
-                    "cbg/inner_steps": rayleigh.diagnostics.inner_steps,
-                    "cbg/rejected_steps": rayleigh.diagnostics.rejected_steps,
-                    "cbg/metric_evaluations": rayleigh.diagnostics.metric_evaluations,
-                    "cbg/fd_cancellation": spectral.fd_cancellation,
+                    "cbg/delta": spectral_delta if spectral_delta is not None else 0.,
+                    "cbg/u_norm": diagnostics.u_euclidean_norm,
+                    "cbg/b_norm": diagnostics.b_mu_norm,
+                    "cbg/eig_residual": diagnostics.eig_residual_norm,
+                    "cbg/relative_residual": diagnostics.relative_residual,
+                    "cbg/converged": float(diagnostics.converged),
+                    "cbg/inner_steps": diagnostics.inner_steps,
+                    "cbg/rejected_steps": diagnostics.rejected_steps,
+                    "cbg/metric_evaluations": diagnostics.metric_evaluations,
+                    "cbg/fd_cancellation": spectral_cancellation if spectral_cancellation is not None else 0.,
+                    "cbg/fd_diagnostics_applicable": float(spectral_backend == "centered_fd"),
+                    "cbg/direct_terms": spectral_terms,
                     "cbg/rayleigh_start": rayleigh_values[0],
                     "cbg/rayleigh_final": rayleigh_values[-1],
                     "cbg/warm_start_cosine": (
-                        rayleigh.diagnostics.warm_start_cosine
-                        if rayleigh.diagnostics.warm_start_cosine is not None
+                        diagnostics.warm_start_cosine
+                        if diagnostics.warm_start_cosine is not None
                         else 0.0
                     ),
                 }
             )
             for index, value in enumerate(rayleigh_values):
                 metrics[f"cbg/rayleigh_iter_{index}"] = value
+        if not preservation_only or zero_safety:
+            assert diagnostics is not None
+            metrics["cbg/kernel_columns"] = diagnostics.kernel_columns
+            for key in ("eigengap", "kernel_asymmetry", "kernel_projection", "damping_fraction", "dual_value_error",
+                        "enclosure_lower", "enclosure_upper", "enclosure_eta", "enclosure_gamma", "b_orthogonality", "ritz_eigengap"):
+                value = getattr(diagnostics, key)
+                if value is not None:
+                    metrics[f"cbg/{key}"] = value
+            for key in ("basis_size", "enclosure_checks", "safety_row_pullbacks", "dual_fallback", "refinement_steps", "refinement_jvps"):
+                metrics[f"cbg/{key}"] = float(getattr(diagnostics, key))
+            if diagnostics.fallback_reason:
+                metrics[f"cbg/fallback_{diagnostics.fallback_reason}"] = 1.
+            if diagnostics.damping_fraction is None:
+                metrics["cbg/damping_fraction"] = mu * diagnostics.u_euclidean_norm.square() / diagnostics.qb_damped
+            if zero_safety:
+                metrics["cbg/mu"] = mu
+                metrics["cbg/converged"] = 1.0
+                metrics["cbg/metric_evaluations"] = diagnostics.metric_evaluations
+        metrics.update({f"system/{phase}_time": duration for phase, duration in phase_times.items()})
+        metrics["cbg/dual_column_batch_size"] = self.cbg_args.dual_column_batch_size
+        metrics["cbg/dual_residual_tolerance"] = self.cbg_args.dual_residual_tolerance
+        metrics["cbg/effective_dual_column_width"] = float(
+            getattr(self, "_effective_dual_column_width", self.cbg_args.dual_column_batch_size)
+        )
+        metrics["cbg/dual_column_fallbacks"] = float(
+            getattr(self, "_dual_column_fallbacks", 0)
+        )
+        metrics["cbg/effective_functional_chunk_size"] = float(
+            getattr(self, "_effective_functional_chunk_size", self.cbg_args.functional_chunk_size)
+        )
+        metrics["cbg/functional_chunk_fallbacks"] = float(
+            getattr(self, "_functional_chunk_fallbacks", 0)
+        )
         self._record_metrics(metrics)
 
         reported_loss = alignment_loss.detach() + self.cbg_args.alpha * benign_loss.detach()
+        if self.cbg_args.cbg_version == "v5" and not preservation_only:
+            reported_loss = reported_loss + effective_beta * center_rho
         return reported_loss / divisor
+
+    def _spec_training_step(self, model, inputs):
+        from src.cbg.spec import _clock, spec_training_gradient
+        model.train()
+        if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+            self.optimizer.train()
+        batch = self._prepare_inputs(inputs)
+        self._validate_batch(batch)
+        if (batch["harmful"]["input_ids"].shape[0] != self.cbg_args.safety_batch_size
+            or batch["benign"]["input_ids"].shape[0] != self.cbg_args.benign_batch_size):
+            raise ValueError("joint batch sizes do not match configured m,n")
+        functional_model = self.accelerator.unwrap_model(model)
+        device = batch["benign"]["input_ids"].device
+        started = _clock(device)
+        reference = self._reference_logits(model, batch["benign"]) if self.cbg_args.alpha else None
+        reference_time = _clock(device) - started
+        result = spec_training_gradient(functional_model, batch, self.cbg_args.spec_config(),
+                                        reference_logits=reference)
+        parameters = OrderedDict((name, p) for name, p in functional_model.named_parameters() if p.requires_grad)
+        divisor = self._gradient_accumulation_divisor()
+        self._backward_explicit_gradient(parameters, result.gradient, divisor=divisor)
+        result.diagnostics["reference_time"] = reference_time
+        result.diagnostics["training_step_time"] = _clock(device) - started
+        self._record_metrics({f"cbg/{name}": value for name, value in result.diagnostics.items()})
+        return result.loss / divisor
 
     @staticmethod
     def _validate_batch(batch: Mapping[str, Any]) -> None:
@@ -774,7 +1255,7 @@ class CbgTrainer(Trainer):
             )
             if not math.isfinite(value):
                 raise FloatingPointError(f"non-finite CBG diagnostic {key}: {value}")
-            if key == "system/max_memory_allocated":
+            if key in {"system/max_memory_allocated", "system/max_memory_reserved"}:
                 self._pending_metric_maxima[key] = max(
                     value,
                     self._pending_metric_maxima.get(key, 0.0),
@@ -805,6 +1286,14 @@ class CbgTrainer(Trainer):
     def _checkpoint_config(self) -> dict[str, Any]:
         return json.loads(json.dumps(asdict(self.cbg_args), sort_keys=True))
 
+    def _checkpoint_runtime(self) -> dict[str, Any]:
+        """TrainingArguments fields that change V5's executed batch/operator."""
+        return {name: getattr(self.args, name, None) for name in (
+            "per_device_train_batch_size", "gradient_accumulation_steps", "bf16", "fp16",
+            "dataloader_drop_last", "seed", "data_seed",
+            "max_grad_norm",
+        )} | {"matmul_precision": torch.get_float32_matmul_precision()}
+
     def _save(self, output_dir: str | None = None, state_dict=None) -> None:
         super()._save(output_dir=output_dir, state_dict=state_dict)
         output_path = Path(output_dir or self.args.output_dir)
@@ -827,6 +1316,8 @@ class CbgTrainer(Trainer):
             "global_step": int(self.state.global_step),
             "admissible_names": list(self._admissible_names),
             "prev_u": prev_u_cpu,
+            "prev_basis": [{name: value.detach().cpu().clone() for name, value in v.items()}
+                           for v in getattr(self, "prev_basis", ())],
             "calibrated_mu": self.calibrated_mu,
             "beta_candidate_sum": self._beta_candidate_sum,
             "beta_candidate_count": self._beta_candidate_count,
@@ -834,6 +1325,7 @@ class CbgTrainer(Trainer):
             "config": config,
             "config_fingerprint": fingerprint,
             "data_manifest": getattr(self, "data_manifest", None),
+            "runtime_signature": self._checkpoint_runtime(),
         }
 
         config_path = output_dir / CBG_CONFIG_NAME
@@ -898,6 +1390,8 @@ class CbgTrainer(Trainer):
             raise ValueError("CBG checkpoint configuration fingerprint mismatch")
         if state.get("data_manifest") != getattr(self, "data_manifest", None):
             raise ValueError("CBG checkpoint data manifest differs from the current data/split")
+        if self.cbg_args.cbg_version in {"v5", "spec"} and state.get("runtime_signature") != self._checkpoint_runtime():
+            raise ValueError("V5 checkpoint batch, accumulation or precision settings differ")
 
         saved_names = tuple(state.get("admissible_names", ()))
         if saved_names != self._admissible_names:
@@ -920,6 +1414,8 @@ class CbgTrainer(Trainer):
                     )
                 if not bool(torch.isfinite(value).all().item()):
                     raise ValueError(f"CBG checkpoint prev_u is non-finite for {name!r}")
+                if self.cbg_args.cbg_version == "v5" and value.dtype != parameter.dtype:
+                    raise ValueError("V5 checkpoint direction precision differs from current coordinates")
                 restored[name] = value.to(
                     device=parameter.device,
                     dtype=parameter.dtype,
@@ -927,6 +1423,22 @@ class CbgTrainer(Trainer):
             self.prev_u = tree_detach(restored)
 
         calibrated_mu = state.get("calibrated_mu")
+        saved_basis = state.get("prev_basis", [])
+        if not isinstance(saved_basis, (tuple, list)) or len(saved_basis) > self.cbg_args.ritz_max_size:
+            raise ValueError("invalid checkpoint warm basis size")
+        restored_basis = []
+        for vector in saved_basis:
+            if not isinstance(vector, Mapping) or tuple(vector) != self._admissible_names:
+                raise ValueError("invalid checkpoint warm basis parameter order")
+            restored = OrderedDict()
+            for name, parameter in parameters.items():
+                value = vector[name]
+                if (not isinstance(value, Tensor) or value.shape != parameter.shape
+                    or value.dtype != parameter.dtype or not bool(torch.isfinite(value).all())):
+                    raise ValueError("invalid checkpoint warm basis leaf")
+                restored[name] = value.detach().to(parameter)
+            restored_basis.append(restored)
+        self.prev_basis = tuple(restored_basis)
         if calibrated_mu is None:
             self.calibrated_mu = None
         else:

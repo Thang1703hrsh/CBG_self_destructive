@@ -34,6 +34,8 @@ class EvalArguments:
         metadata={"help": "WandB project name"}
     )
     lora_attack: bool = field(default=False, metadata={"help": "Whether to use LoRA"})
+    cbg_split_manifest: Optional[str] = None
+    beavertails_path: str = "data/beavertails_with_refusals_train.json"
 
 
 def main():
@@ -69,7 +71,9 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(eval_args.model_name, torch_dtype=torch.bfloat16)
     model.to("cuda:0")
     harmful_dataset, harmless_dataset, test_dataset = construct_beavertails_dataset(
-            tokenizer, attack_size=eval_args.attack_size
+            tokenizer, attack_size=eval_args.attack_size,
+            split_manifest_path=eval_args.cbg_split_manifest,
+            beavertails_path=eval_args.beavertails_path,
                 )
 
     if eval_args.pre_utility:

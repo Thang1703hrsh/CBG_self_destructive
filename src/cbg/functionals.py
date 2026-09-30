@@ -369,14 +369,55 @@ def make_benign_functional(
     *,
     buffers: Mapping[str, Tensor] | None = None,
     chunk_size: int = 0,
+    token_blocks: int = 1,
 ) -> FunctionalMap:
-    """Bind a fixed benign minibatch into a function of parameters."""
+    """Bind benign geometry; token_blocks>1 prevents cross-block cancellation.
+
+    Output slots are sqrt(q * block_length / response_length) * block_mean.
+    Uniform weighting by 1/(B*q) therefore gives each token block its response
+    length fraction and each example mass 1/B, including short responses.
+    Preservation KL and alignment NLL are unaffected.
+    """
 
     _validate_sequence_batch(benign_batch, name="benign_batch")
+    if isinstance(token_blocks, bool) or not isinstance(token_blocks, int) or token_blocks < 1:
+        raise ValueError("token_blocks must be a positive integer")
 
     blocks = []
     for _, batch in sequence_chunks(benign_batch, chunk_size):
-        def term(parameters, batch=batch):
-            return _sequence_functional(model, parameters, batch, buffers=buffers)
-        blocks.append(FunctionalBlock(batch["input_ids"].shape[0], ((1., term),)))
+        if token_blocks == 1:
+            def term(parameters, batch=batch):
+                return _sequence_functional(model, parameters, batch, buffers=buffers)
+        else:
+            # Bind partition metadata before autodiff. Empty slots of a short
+            # response have zero weight, not a fabricated token or a NaN.
+            mask = batch["response_mask"][:, 1:].bool()
+            if "attention_mask" in batch:
+                mask = mask & batch["attention_mask"][:, 1:].bool()
+            lengths = mask.sum(-1)
+            if bool((lengths <= 0).any()):
+                raise ValueError("every benign example must contain a response token")
+            effective_q = lengths.clamp_max(token_blocks)
+            ordinal = (mask.cumsum(-1) - 1).clamp_min(0)
+            slot = torch.div(ordinal * effective_q[:, None], lengths[:, None], rounding_mode="floor")
+            rows = torch.arange(len(lengths), device=mask.device)[:, None].expand_as(mask)
+            indices = (rows * token_blocks + slot)[mask]
+            size = len(lengths) * token_blocks
+            counts = torch.zeros(size, device=mask.device, dtype=torch.long).scatter_add(
+                0, indices, torch.ones_like(indices),
+            )
+            repeated_lengths = lengths.repeat_interleave(token_blocks)
+            targets = batch["input_ids"][:, 1:][mask].long()
+            def term(parameters, batch=batch, mask=mask, indices=indices,
+                     counts=counts, repeated_lengths=repeated_lengths, targets=targets, size=size):
+                logits = _functional_logits(model, parameters, batch, buffers=buffers)
+                active = logits[:, :-1, :][mask]
+                if active.dtype in (torch.float16, torch.bfloat16):
+                    active = active.float()
+                logp = active.log_softmax(-1).gather(-1, targets[:, None]).squeeze(-1)
+                sums = torch.zeros(size, device=logp.device, dtype=logp.dtype).scatter_add(0, indices, logp)
+                n = counts.to(logp.dtype)
+                weights = (token_blocks * n / repeated_lengths.to(logp.dtype)).sqrt()
+                return sums / n.clamp_min(1) * weights
+        blocks.append(FunctionalBlock(batch["input_ids"].shape[0] * token_blocks, ((1., term),)))
     return BatchedFunctional(tuple(blocks), tuple(benign_batch.values()), model)

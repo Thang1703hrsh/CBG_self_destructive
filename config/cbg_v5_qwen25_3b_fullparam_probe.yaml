@@ -1,0 +1,68 @@
+# One-step feasibility probe for exact full-parameter CBG V5 on two H100s.
+# GPU 0 evaluates the trainable model; GPU 1 owns the frozen reference model.
+TrainingArguments:
+  output_dir: "ckpt/cbg_v5_qwen25_3b_fullparam_probe"
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 1
+  max_steps: 1
+  learning_rate: !!float 6e-5
+  weight_decay: 0.0
+  optim: "adamw_torch"
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.0
+  max_grad_norm: null
+  # Experimental feasibility probe only; production V5 remains FP32.
+  bf16: true
+  fp16: false
+  tf32: false
+  gradient_checkpointing: false
+  torch_compile: false
+  logging_steps: 1
+  save_strategy: "no"
+  save_only_model: false
+  report_to: "none"
+  remove_unused_columns: false
+  dataloader_drop_last: true
+  dataloader_num_workers: 0
+  dataloader_pin_memory: true
+  seed: 42
+  data_seed: 42
+
+CbgArguments:
+  method: "cbg"
+  cbg_version: "v5"
+  parameter_space: "full"
+  spectral_derivative_backend: "direct_rof"
+  experimental_bf16_geometry: true
+  geometry_solver: "dual"
+  model_name: "Qwen/Qwen2.5-3B-Instruct"
+  tokenizer_name: "Qwen/Qwen2.5-3B-Instruct"
+  reference_mode: "separate_model"
+  reference_device: "cuda:1"
+  wandb_project_name: "cbg-v5-fullparam"
+  wandb_run_name: "cbg-v5-qwen25-3b-fullparam-probe"
+  beavertails_path: "data/beavertails_with_refusals_train.json"
+  defense_size: 4000
+  attack_size: 1000
+  split_seed: 2026
+  data_shuffle: true
+  context_length: 256
+  benign_token_blocks: 2
+  functional_chunk_size: 1
+  preservation_chunk_size: 1
+  cbg_attention_implementation: "eager"
+  damping_mode: "absolute"
+  mu: 0.001
+  alpha: 1.0
+  beta: 0.00002
+  beta_mode: "grad_ratio"
+  beta_target_ratio: 0.25
+  beta_calibration_steps: 1
+  beta_min: !!float 1e-7
+  beta_max: 0.001
+  dual_max_size: 64
+  dual_tolerance: 0.0001
+  dual_kernel_tolerance: 0.00001
+  dual_column_batch_size: 1
+  dual_column_fallback: false
+  dual_refinement_steps: 3

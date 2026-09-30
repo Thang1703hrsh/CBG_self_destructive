@@ -3,4 +3,4 @@
 
 CUDA_VISIBLE_DEVICES=0 python -m src.train \
     --method cbg \
-    --config config/cbg_llama32_3b.yaml
+    --config config/cbg_spec_pilot.yaml "$@"

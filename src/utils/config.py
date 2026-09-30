@@ -10,7 +10,7 @@ from transformers import HfArgumentParser
 
 def yaml_to_namespace(yaml_file):
     # load yaml
-    with open(yaml_file, 'r') as f:
+    with open(yaml_file, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     # create a new namespace
     namespace = argparse.Namespace()
@@ -20,7 +20,7 @@ def yaml_to_namespace(yaml_file):
     return namespace
 
 def load_yaml_config(config_path):
-    with open(config_path, 'r') as f:
+    with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
     
 class MyParser(HfArgumentParser):
@@ -95,12 +95,27 @@ class MyParser(HfArgumentParser):
             # in case of duplicate arguments the last one has precedence
             # args specified via the command line should overwrite args from files, so we add them last
             args = file_args + args if args is not None else file_args + sys.argv[1:]
-        namespace, remaining_args = self.parse_known_args(args=args)
+        # Let argparse apply CLI precedence, including --key=value and boolean
+        # aliases such as --no_*. Looking for literal '--key' strings silently
+        # discarded valid overrides and could change the executed CBG method.
+        defaults = default_values or {}
+        destinations = {action.dest for action in self._actions}
+        unknown = set(defaults) - destinations
+        if unknown:
+            raise ValueError(f"Unknown configuration fields: {sorted(unknown)}")
+        original_defaults = [(action, action.default) for action in self._actions]
+        parser_defaults = self._defaults.copy()
+        try:
+            self.set_defaults(**defaults)
+            namespace, remaining_args = self.parse_known_args(args=args)
+        finally:
+            for action, default in original_defaults:
+                action.default = default
+            self._defaults = parser_defaults
         outputs = []
         for dtype in self.dataclass_types:
             keys = {f.name for f in dataclasses.fields(dtype) if f.init}
-            inputs = {k: v for k, v in default_values.items() if k in keys} # yaml_defaults
-            inputs.update({k: v for k, v in vars(namespace).items() if k in keys and f'--{k}' in args}) # sys.argv
+            inputs = {k: v for k, v in vars(namespace).items() if k in keys}
             for k in keys:
                 delattr(namespace, k)
             obj = dtype(**inputs)

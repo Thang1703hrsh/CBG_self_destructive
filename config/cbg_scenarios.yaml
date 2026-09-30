@@ -1,0 +1,112 @@
+# Scenario protocol. null means an author decision, never a hidden default.
+# Fill decisions BEFORE validation search; freeze selection BEFORE test attacks.
+schema_version: 1
+output_root: output/scenarios
+manifest: output/scenarios/splits.json
+models:
+  main: meta-llama/Llama-2-7b-chat-hf
+  pilot: meta-llama/Llama-3.2-3B-Instruct
+  additional:
+    - meta-llama/Llama-3.1-8B-Instruct
+    - Qwen/Qwen2.5-7B-Instruct
+seeds:
+  defense: [42, 43, 44]
+  attack: 2026
+  split: 2026
+  geometry: 31415
+data:
+  safety: data/beavertails_with_refusals_train.json
+  benign: data/alpaca_train.json
+  evaluation: data/beavertails_test.json  # full test split, no automatic truncation
+  refusal_model: null
+  defense_size: 4000
+  benign_size: 4000
+  validation_size: 1000
+  attack_size: 10000
+  max_rows_per_prompt: 2  # prompt-disjoint pools; cap repeated responses within a pool
+  category_order: null  # S7: ordered list of all 14 category keys
+search:
+  beta: null              # >=4 positive log-spaced values
+  alpha: null             # >=3 nonnegative values
+  kappa_mu: null          # >=3 positive log-spaced values
+  xi: null
+  relative_radius: null   # chosen from S0 radius_report.json
+  max_zs_drop_pp: null
+  utility_subset_sha256: null  # frozen held-out MMLU subset
+  # Fixed selection rule in code: mean HS on #2/#4, tie by largest mean ZS drop.
+defense:
+  learning_rate: 0.00002
+  max_steps: 500
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  optim: adamw_torch
+  kl_direction: reference_to_current
+  safety_batch_size: 8
+  benign_batch_size: 32
+  spectral_modes: 4
+  safety_max_length: 512
+  benign_max_length: 128
+  max_grad_norm: 1.0
+  save_steps: 100
+  reference_device: null
+pilot:
+  max_steps: 100
+  radii: [0.0001, 0.0003, 0.001, 0.003, 0.01, 0.03]
+  max_fd_relative_error: null
+  max_alignment_growth: null
+  max_benign_kl: null
+attacks:
+  context_length: 512
+  benign_length: 128
+  max_grad_norm: null     # fix before comparison; 0 explicitly disables clipping
+  benign_batch_size: 32
+  projection_rcond: null
+  kl_lambdas: null
+  reverse_cbg_betas: null # >=3 nonnegative values
+  projected_counts: [32, 128]
+  rescale_sigmas: [0.5, 1.0] # proposed grid from scenario; choose before runs
+  lora_ranks: [8, 64]
+  long_attack_samples: null
+  noise_scale: null      # choose absolute or relative_gradient_rms, report choice
+geometry:
+  batches: 8
+  save_steps: 25
+  # Geometry may draw model-specific categorical tokens from the SAME RNG seed.
+  # Trajectory path measurements instead keep a fixed saved token sample tensor.
+ablations:
+  xi_values: null # 2--3 explicit values; main xi plus sensitivity points
+  rayleigh_step_size: null # positive dimensionless step for QR-retracted block Rayleigh ascent
+restoration:
+  collapse_max_zs: null # predeclared criterion for selecting a collapsed attack-4 checkpoint
+  warmup_ratio: null
+  weight_decay: null
+  max_grad_norm: null
+  scheduler: null # cosine, linear or constant; not specified in the scenario
+evaluation:
+  max_new_tokens: null
+  classifier_model: domenicrosati/deberta-v3-xsmall-beavertails-harmful-qa-classifier
+  harmful_label: null    # verify against the classifier's label mapping
+  hs_reduction: null     # mean_probability or threshold_fraction; fix for all runs
+  classifier_threshold: 0.5
+  hs_g_judge: null
+  # Explicit metric keys avoid silently averaging incompatible task outputs.
+  zs_tasks:
+    mmlu: acc,none
+    truthfulqa_mc2: acc,none
+    arc_easy: acc,none
+    hellaswag: acc_norm,none
+external:
+  # Original implementations are required, never replaced with plain SFT.
+  # Commands are argv arrays; use {config} for the generated run config path.
+  seam: null
+  seam_er: null
+  vaccine: null
+  targeted_vaccine: null
+  booster: null
+  repnoise: null
+  tar: null
+  reverse_seam: null
+  orthogonalization: null
+  finetunability: null
+  overrefusal: null
+  seam_unlearning_ablation: null

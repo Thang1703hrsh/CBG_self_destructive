@@ -169,6 +169,34 @@ output/
 trainer_output/
 logs/
 
+# Local datasets and generated scratch artifacts. Keep dataset-building source
+# code, but never stage downloaded/generated records.
+/data/*
+!/data/*.py
+/seam/data/*
+!/seam/data/*.py
+/tmp/
+
+# Model, optimizer, checkpoint, and array artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npy
+*.npz
+*.arrow
+*.parquet
+
+# Local credentials and service state
+.env.*
+!.env.example
+.modal/
+.huggingface/
+
 # Local CBG method specifications
 /CBG_CODEX_IMPLEMENTATION_GUIDE.md
 /CBG_CODEX_IMPLEMENTATION_GUIDE_fix.md
+/CBG_CODEX_IMPLEMENTATION_GUIDE_v2.md
+
+# Workspace-local dependency used by offline CBG integration checks
+/tmp/cbg_test_deps/

@@ -1,13 +1,14 @@
-"""Center-point scalarization and centered finite-difference CBG gradient."""
+"""V5 direct spectral differentiation and the legacy FD numerical oracle."""
 
 from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from torch import Tensor
+from torch.func import jvp
 
 from src.cbg.geometry import (
     FunctionalMap, MetricProduct, functional_blocks, metric_product_with_jvp,
@@ -15,12 +16,14 @@ from src.cbg.geometry import (
 from src.cbg.tree_ops import (
     OrderedTensorTree,
     TensorTree,
+    accumulate_detached_gradient,
     assert_same_structure,
     tree_add,
     tree_detach,
     tree_dot,
     tree_norm,
     tree_scale,
+    scale_owned_detached_tree_,
     tree_sub,
 )
 
@@ -33,9 +36,9 @@ class SpectralCenter:
     """All frozen center-point quantities used by the spectral derivative."""
 
     direction: OrderedTensorTree
-    gh_direction: OrderedTensorTree
-    gb_direction: OrderedTensorTree
-    b_direction: OrderedTensorTree
+    gh_direction: OrderedTensorTree | None
+    gb_direction: OrderedTensorTree | None
+    b_direction: OrderedTensorTree | None
     b: Tensor
     rho: Tensor
     qh: Tensor
@@ -52,18 +55,79 @@ class SpectralCenter:
     mu: float
 
 
+def compact_spectral_center(center: SpectralCenter) -> SpectralCenter:
+    """Keep the frozen outer scalarization, without the three solver products.
+
+    Does not mutate the input. The caller must release its original center
+    (including RayleighResult) for those product buffers to be freed. Cache
+    identity and stale-center checks remain intact for direct AD and FD.
+    """
+    return replace(center, gh_direction=None, gb_direction=None, b_direction=None)
+
+
 @dataclass(frozen=True)
 class SpectralGradientResult:
     gradient: OrderedTensorTree
     center: SpectralCenter
-    delta: Tensor
+    delta: Tensor | None
     grad_plus: OrderedTensorTree | None
     grad_minus: OrderedTensorTree | None
-    fd_cancellation: Tensor
+    fd_cancellation: Tensor | None
+    backend: str = "centered_fd"
+    terms_evaluated: int = 0
+
+
+def rescale_owned_spectral_center_(center: SpectralCenter, scale: float | Tensor) -> SpectralCenter:
+    """Rescale an exclusively owned detached center without allocating four P-trees.
+
+    Solver centers own their direction and metric-product buffers.  Storage
+    aliasing with live parameters or between center trees is rejected before
+    mutation.  Small directional responses and scalar contractions are then
+    recomputed exactly as in ``compute_spectral_center``.
+    """
+    trees = (center.direction, center.gh_direction, center.gb_direction, center.b_direction)
+    if any(tree is None for tree in trees):
+        raise ValueError("cannot normalize a compact outer center")
+    # Validate before changing even a single leaf.
+    scale_tensor = torch.as_tensor(scale)
+    if scale_tensor.numel() != 1 or not bool(torch.isfinite(scale_tensor)) or not bool(scale_tensor != 0):
+        raise ValueError("center scale must be a finite nonzero scalar")
+    scale = scale_tensor.detach().clone()
+    parameter_ptrs = {token[5] for token in center.parameter_token}
+    storage_ptrs = []
+    for tree in trees:
+        if not isinstance(tree, OrderedDict):
+            raise TypeError("solver center trees must be owned OrderedDict instances")
+        for value in tree.values():
+            if value.requires_grad or value.grad_fn is not None:
+                raise ValueError("solver center must be detached before in-place normalization")
+            ptr = value.untyped_storage().data_ptr()
+            if ptr in parameter_ptrs:
+                raise ValueError("solver center aliases live model parameters")
+            storage_ptrs.append(ptr)
+    if len(storage_ptrs) != len(set(storage_ptrs)):
+        raise ValueError("solver center trees share storage and cannot be normalized in place")
+    for tree in trees:
+        scale_owned_detached_tree_(tree, scale)
+    zh, zb = center.zh * scale, center.zb * scale
+    qh = tree_dot(center.direction, center.gh_direction)
+    qb = tree_dot(center.direction, center.gb_direction)
+    b = tree_dot(center.direction, center.b_direction)
+    if not bool(torch.isfinite(b)) or not bool(b > 0):
+        raise FloatingPointError("rescaled spectral center has an invalid damped denominator")
+    rho = qh / b
+    if not bool(torch.isfinite(rho)) or not bool(torch.isfinite(qb)):
+        raise FloatingPointError("non-finite rescaled spectral center")
+    return replace(
+        center, b=b.detach(), rho=rho.detach(), qh=qh.detach(), qb=qb.detach(),
+        zh=zh.detach(), zb=zb.detach(), ch=(zh / zh.numel()).detach(),
+        cb=(zb / zb.numel()).detach(), direction_token=_tree_token(center.direction),
+    )
 
 
 def _tree_token(parameters: TensorTree) -> tuple:
-    return tuple((name, value.data_ptr(), value._version, tuple(value.shape), value.dtype)
+    return tuple((name, value.data_ptr(), value._version, tuple(value.shape), value.dtype,
+                  value.untyped_storage().data_ptr())
                  for name, value in parameters.items())
 
 
@@ -132,6 +196,8 @@ def parameter_gradient(
     )
     result: OrderedTensorTree = OrderedDict()
     for (name, parameter), gradient in zip(parameters.items(), gradients):
+        # Ownership belongs to the caller: autograd can return aliases of
+        # parameters, external cotangents, or other gradient leaves.
         result[name] = torch.zeros_like(parameter) if gradient is None else gradient
     return result
 
@@ -144,7 +210,7 @@ def streamed_loss_gradient(
     total_loss, total_gradient = None, None
     for fraction, loss in weighted_losses:
         gradient = tree_detach(parameter_gradient(loss * fraction, parameters))
-        total_gradient = gradient if total_gradient is None else tree_add(total_gradient, gradient)
+        total_gradient = accumulate_detached_gradient(total_gradient, gradient)
         value = loss.detach() * fraction
         total_loss = value if total_loss is None else total_loss + value
         del loss, gradient
@@ -171,7 +237,7 @@ def compute_spectral_center(
     hp = safety_product or metric_product_with_jvp(safety_functional, parameters, frozen_direction)
     bp = benign_product or metric_product_with_jvp(benign_functional, parameters, frozen_direction)
     gh_direction, gb_direction = hp.vector, bp.vector
-    b_direction = tree_add(gb_direction, tree_scale(frozen_direction, mu))
+    b_direction = tree_add(gb_direction, frozen_direction, alpha=mu)
     qh = tree_dot(frozen_direction, gh_direction)
     qb = tree_dot(frozen_direction, gb_direction)
     b = tree_dot(frozen_direction, b_direction)
@@ -384,6 +450,72 @@ def centered_spectral_gradient(
         grad_minus=tree_detach(grad_minus) if retain_endpoint_gradients else None,
         fd_cancellation=cancellation.detach(),
     )
+
+
+def direct_spectral_gradient(
+    safety_functional: FunctionalMap,
+    benign_functional: FunctionalMap,
+    parameters: TensorTree,
+    direction: TensorTree,
+    *,
+    mu: float | Tensor,
+    center: SpectralCenter | None = None,
+    allow_constant_tangent: bool = False,
+) -> SpectralGradientResult:
+    """V5 section 4: stream (2/b) grad_theta[JVP(Phi, stop_gradient(u))].
+
+    Each response graph is released before evaluating the next term. No live
+    parameter is perturbed and no eigensolver trajectory is differentiated.
+    Constant tangents are permitted only explicitly (e.g. affine toy maps):
+    disconnected tangents in a nonlinear model must not silently become zeros.
+    Transform errors propagate; FD is a separately selected oracle backend.
+    """
+    assert_same_structure(parameters, direction)
+    if not all(p.requires_grad and p.dtype in (torch.float32, torch.float64)
+               for p in parameters.values()):
+        raise ValueError("direct spectral AD requires differentiable FP32/FP64 coordinates")
+    # The qualified V5 path uses the same deterministic FP32/64 forward at
+    # the center and derivative. Import locally to avoid the dual/rayleigh cycle.
+    from src.cbg.dual import _validate_precision
+    _validate_precision((safety_functional, benign_functional), parameters)
+    if center is None:
+        center = compute_spectral_center(safety_functional, benign_functional,
+                                         parameters, tree_detach(direction), mu=mu)
+    elif (center.parameter_token != _tree_token(parameters)
+          or center.direction_token != _tree_token(direction)
+          or center.functional_ids != (id(safety_functional), id(benign_functional))
+          or center.functional_state != _functional_state(safety_functional, benign_functional)
+          or center.precision_token != _precision_token(parameters)
+          or center.mu != float(mu)):
+        raise ValueError("stale spectral center: parameters, direction, functions, precision or mu changed")
+    phi = make_scalarized_functional(safety_functional, benign_functional, center)
+    gradient = None
+    with torch.enable_grad():
+        for index, term in enumerate(phi.terms):
+            primal, tangent = jvp(term, (parameters,), (center.direction,))
+            if not bool(torch.isfinite(primal)) or not bool(torch.isfinite(tangent)):
+                raise FloatingPointError(f"non-finite direct spectral term {index}")
+            del primal
+            if not tangent.requires_grad and not allow_constant_tangent:
+                raise RuntimeError(
+                    f"direct spectral term {index} has a disconnected/constant tangent; "
+                    "validate derivative support before explicitly allowing an affine zero Hessian"
+                )
+            part = tree_detach(parameter_gradient(tangent, parameters))
+            if not bool(torch.isfinite(tree_norm(part))):
+                raise FloatingPointError(f"non-finite direct spectral gradient in term {index}")
+            gradient = accumulate_detached_gradient(gradient, part)
+            del tangent, part
+    if gradient is None:
+        raise ValueError("empty spectral scalarization")
+    # Privately owned storage: scale without allocating another full P-vector.
+    with torch.no_grad():
+        for value in gradient.values():
+            value.mul_(2 / center.b.detach())
+    if not bool(torch.isfinite(tree_norm(gradient))):
+        raise FloatingPointError("non-finite direct spectral gradient")
+    return SpectralGradientResult(gradient, center, None, None, None, None,
+                                  backend="direct_rof", terms_evaluated=len(phi.terms))
 
 
 def compose_training_gradient(

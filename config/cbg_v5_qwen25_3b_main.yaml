@@ -1,0 +1,139 @@
+# CBG V5 main candidate for the SEAM-style Qwen2.5-3B experiment.
+#
+# The V5 dual solver and direct reverse-over-forward derivative are currently
+# qualified only with FP32 eager forwards.  Do not enable BF16, FP16, gradient
+# checkpointing, torch.compile, or more than one visible GPU without repeating
+# the numerical V5 qualification suite on the target runtime.
+TrainingArguments:
+  output_dir: "ckpt/cbg_v5_qwen25_3b_main_seed42"
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 1
+  max_steps: 500
+  learning_rate: !!float 6e-5
+  weight_decay: 0.0
+  optim: "adamw_torch"
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.1
+  # Stability candidate: Trainer clips the accumulated COMBINED gradient once
+  # before AdamW. Loss, fixed calibrated beta and eigensolver gates stay intact.
+  # This changes optimization dynamics; compare against 0 (disabled) as an ablation.
+  max_grad_norm: 1.0
+
+  # Direct V5 differentiation currently requires full FP32 model execution.
+  bf16: False
+  fp16: False
+  tf32: False
+  gradient_checkpointing: False
+  torch_compile: False
+
+  logging_steps: 1
+  save_strategy: "steps"
+  # The verified solver intentionally stops before an unsafe update. Frequent
+  # checkpoints bound lost work if a previously unseen numerical outlier occurs.
+  save_steps: 50
+  save_total_limit: 2
+  save_only_model: False
+  report_to: "none"
+  remove_unused_columns: False
+  dataloader_drop_last: True
+
+  # The batches are already materialized tensors.  Extra loader workers copy
+  # state and add RAM/CPU overhead without helping the geometry-dominated step.
+  dataloader_num_workers: 0
+  dataloader_pin_memory: True
+  dataloader_persistent_workers: False
+
+  seed: 42
+  data_seed: 42
+
+CbgArguments:
+  method: "cbg"
+  cbg_version: "v5"
+  spectral_derivative_backend: "direct_rof"
+  geometry_solver: "dual"
+
+  model_name: "Qwen/Qwen2.5-3B-Instruct"
+  tokenizer_name: "Qwen/Qwen2.5-3B-Instruct"
+  wandb_project_name: "cbg-v5"
+  wandb_run_name: "cbg-v5-qwen25-3b-main-seed42"
+  reference_mode: "disabled_adapter"
+
+  beavertails_path: "data/beavertails_with_refusals_train.json"
+  defense_size: 4000
+  attack_size: 1000
+  split_seed: 2026
+  data_shuffle: True
+  context_length: 256
+
+  lora_rank: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  lora_bias: "none"
+  lora_target_modules: ["q_proj", "v_proj"]
+
+  # These are exact internal streams.  They retain geometry batch 8 while
+  # minimizing activation/logit peaks; they are not gradient accumulation.
+  benign_token_blocks: 2
+  # H100 qualification: chunk 4 reduced the measured geometry time from
+  # 164.58 s to 64.75 s while retaining all V5 numerical checks. Chunk 8
+  # exceeded the declared kernel-asymmetry tolerance and is not accepted.
+  functional_chunk_size: 4
+  preservation_chunk_size: 8
+  cbg_attention_implementation: "eager"
+
+  # The requested mu=1e-3 is an absolute mathematical damping value.  Relative
+  # mode would ignore it after calibration, so make the intended choice explicit.
+  damping_mode: "absolute"
+  mu: 0.001
+  damping_fraction: 0.05
+  damping_calibration_directions: 8
+  mu_floor: !!float 1e-8
+
+  alpha: 1.0
+  # The A100/Qwen probe measured ||g_CBG||=9952.31 and
+  # ||g_preserve||=0.85123.  Fixed beta=1e-2 made the spectral term about 117x
+  # larger than preservation.  Calibrate around the declared 0.25 ratio for
+  # ten optimizer steps, then freeze the checkpointed running mean.
+  beta: 0.00002
+  beta_mode: "grad_ratio"
+  beta_target_ratio: 0.25
+  beta_calibration_steps: 10
+  beta_min: !!float 1e-7
+  beta_max: 0.001
+
+  dual_max_size: 64
+  dual_tolerance: 0.0001
+  # Real-model FP32 qualification on L40S observed a reproducible full-space
+  # operator residual floor of 1.31e-3 while the independently reconstructed
+  # eigenvalue error stayed below 7e-7. Keep the value/kernel gate strict and
+  # declare the residual backward-error allowance separately.
+  dual_residual_tolerance: 0.002
+  dual_kernel_tolerance: 0.00001
+  # On Qwen2.5-3B/H100, width 3 passed the independent value/residual checks
+  # without fallback and was faster than width 2. Width 4 previously required
+  # a fallback. Column batching does not change the functional batch, sample
+  # kernel, V5 objective, or direct outer derivative.
+  dual_column_batch_size: 3
+  # If a later batch misses only the independent residual/value verification,
+  # retry a narrower evaluation of the identical operator. All other numerical
+  # failures still raise; tolerance, mu, data and the V5 objective stay fixed.
+  dual_column_fallback: True
+  # Width retries keep functional chunks unchanged. If every width misses only
+  # the independent residual/value gate, rebuild the same maps with chunk 1 and
+  # verify once at width 1. This preserves mu, data, objective and tolerances.
+  dual_functional_chunk_fallback: True
+  # Full-operator cumulative Ritz corrections are attempted only when the
+  # independently reconstructed eigenpair misses dual_residual_tolerance.
+  # Candidates must improve residual and agree with the exact dual eigenvalue.
+  dual_refinement_steps: 3
+
+  # Kept checkpoint-compatible for an explicit bounded-Ritz comparison.  The
+  # main candidate above still selects the verified full-batch dual solver.
+  ritz_initial_size: 2
+  ritz_max_size: 6
+  ritz_max_enrichments: 4
+  ritz_residual_tolerance: 0.0001
+  ritz_orthogonality_tolerance: 0.00001
+  enclosure_atol: !!float 1e-6
+  enclosure_rtol: 0.001
+  enclosure_rho_scale: 1.0

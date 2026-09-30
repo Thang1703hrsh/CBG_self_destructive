@@ -1,0 +1,103 @@
+# CBG V5 H100 preset for SEAM-style Qwen2.5-7B experiments.
+# The numerical path passed a one-step qualification on 2026-09-18. Run the
+# documented five-step qualification before committing to a 500-step launch.
+TrainingArguments:
+  output_dir: "ckpt/cbg_v5_qwen25_7b_main_seed42"
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 1
+  max_steps: 500
+  learning_rate: !!float 6e-5
+  weight_decay: 0.0
+  optim: "adamw_torch"
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.1
+  max_grad_norm: null
+
+  bf16: False
+  fp16: False
+  tf32: False
+  gradient_checkpointing: False
+  torch_compile: False
+
+  logging_steps: 1
+  save_strategy: "steps"
+  save_steps: 250
+  save_total_limit: 2
+  save_only_model: False
+  report_to: "none"
+  remove_unused_columns: False
+  dataloader_drop_last: True
+  dataloader_num_workers: 0
+  dataloader_pin_memory: True
+  dataloader_persistent_workers: False
+  seed: 42
+  data_seed: 42
+
+CbgArguments:
+  method: "cbg"
+  cbg_version: "v5"
+  spectral_derivative_backend: "direct_rof"
+  geometry_solver: "dual"
+
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+  tokenizer_name: "Qwen/Qwen2.5-7B-Instruct"
+  wandb_project_name: "cbg-v5"
+  wandb_run_name: "cbg-v5-qwen25-7b-main-seed42"
+  reference_mode: "disabled_adapter"
+
+  beavertails_path: "data/beavertails_with_refusals_train.json"
+  defense_size: 4000
+  attack_size: 1000
+  split_seed: 2026
+  data_shuffle: True
+  context_length: 256
+
+  parameter_space: "lora"
+  lora_rank: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  lora_bias: "none"
+  lora_target_modules: ["q_proj", "v_proj"]
+
+  benign_token_blocks: 2
+  # Conservative 7B starting point. These chunks preserve the complete batch
+  # and change execution only, not the V5 finite-batch objective.
+  functional_chunk_size: 1
+  preservation_chunk_size: 4
+  cbg_attention_implementation: "eager"
+
+  damping_mode: "absolute"
+  mu: 0.001
+  damping_fraction: 0.05
+  damping_calibration_directions: 8
+  mu_floor: !!float 1e-8
+
+  alpha: 1.0
+  # Recalibrate on the 7B gradients instead of transferring a fixed beta from
+  # the 3B model. The value below is only the degenerate-calibration fallback.
+  beta: 0.00002
+  beta_mode: "grad_ratio"
+  beta_target_ratio: 0.25
+  beta_calibration_steps: 10
+  beta_min: !!float 1e-7
+  beta_max: 0.001
+
+  dual_max_size: 64
+  dual_tolerance: 0.0001
+  # A strict 1e-4 qualification run measured a 2.50e-4 FP32 residual while
+  # value_error remained 1.92e-6. A repeated run at this separately declared
+  # gate passed with residual 2.23e-4 and value_error 1.93e-7.
+  dual_residual_tolerance: 0.0005
+  dual_kernel_tolerance: 0.00001
+  dual_column_batch_size: 2
+  dual_column_fallback: True
+  dual_refinement_steps: 3
+
+  ritz_initial_size: 2
+  ritz_max_size: 6
+  ritz_max_enrichments: 4
+  ritz_residual_tolerance: 0.0001
+  ritz_orthogonality_tolerance: 0.00001
+  enclosure_atol: !!float 1e-6
+  enclosure_rtol: 0.001
+  enclosure_rho_scale: 1.0

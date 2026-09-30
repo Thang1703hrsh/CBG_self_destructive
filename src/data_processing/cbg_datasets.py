@@ -544,6 +544,39 @@ def load_beavertails_refusal_records(
     return records
 
 
+def load_manifest_attack_records(path, manifest_path, *, attack_size):
+    """Select exact held-out source rows and verify the defense manifest.
+
+    Source-index disjointness does not establish semantic/prompt deduplication.
+    """
+    import hashlib
+    if isinstance(attack_size, bool) or not isinstance(attack_size, int) or attack_size < 1:
+        raise ValueError("manifest attack_size must be a positive integer")
+    with Path(manifest_path).open("r", encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    with Path(path).open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    if manifest.get("safety_source_sha256") != digest:
+        raise ValueError("evaluation source hash differs from the CBG defense manifest")
+    records = load_beavertails_refusal_records(path)
+    groups = []
+    for key in ("defense_indices", "attack_indices"):
+        indices = manifest.get(key)
+        if not isinstance(indices, list) or any(
+            isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < len(records) for i in indices
+        ) or len(set(indices)) != len(indices):
+            raise ValueError(f"invalid manifest {key}")
+        groups.append(indices)
+    if set(groups[0]) & set(groups[1]):
+        raise ValueError("manifest defense and attack indices overlap")
+    if attack_size > len(groups[1]):
+        raise ValueError("attack_size exceeds held-out manifest pool")
+    chosen = [records[i] for i in groups[1][:attack_size]]
+    if any(record.get("is_safe") is not False for record in chosen):
+        raise ValueError("manifest attack pool must contain harmful examples")
+    return chosen
+
+
 def construct_cbg_beavertails_datasets(
     tokenizer: Any,
     *,
@@ -640,18 +673,57 @@ def construct_cbg_defense_dataset(
     return CbgDefenseDataset(safety_dataset, benign_dataset)
 
 
+class CbgJointBatchDataset(Dataset):
+    """One item is m safety pairs plus n independent benign sequences.
+
+    Fixed independent permutations make selection reproducible across resume
+    and DataLoader workers. The shorter pool cycles; no examples are packed.
+    Trainer shuffles the joint-batch item order each epoch.
+    """
+    def __init__(self, safety_dataset, benign_dataset, *, m, n, seed=0):
+        if min(m, n) < 1 or len(safety_dataset) < m or len(benign_dataset) < n:
+            raise ValueError("each dataset must contain at least its configured batch size")
+        self.safety, self.benign, self.m, self.n = safety_dataset, benign_dataset, m, n
+        rng = random.Random(seed)
+        self.safety_order = list(range(len(safety_dataset)))
+        self.benign_order = list(range(len(benign_dataset)))
+        rng.shuffle(self.safety_order)
+        rng.shuffle(self.benign_order)
+
+    def __len__(self):
+        return max((len(self.safety) + self.m - 1) // self.m,
+                   (len(self.benign) + self.n - 1) // self.n)
+
+    def __getitem__(self, index):
+        safety = [self.safety[self.safety_order[(index*self.m+i) % len(self.safety)]]
+                  for i in range(self.m)]
+        benign = [self.benign[self.benign_order[(index*self.n+i) % len(self.benign)]]
+                  for i in range(self.n)]
+        batch = collate_cbg_safety_batch(safety)
+        batch["benign"] = _collate_sequences(benign)
+        return batch
+
+
+def collate_cbg_joint_batch(items):
+    if len(items) != 1:
+        raise ValueError("CBG joint batches require DataLoader batch_size=1")
+    return items[0]
+
+
 __all__ = [
     "BENIGN_PROMPT_TEMPLATE",
     "BT_CATEGORIES",
     "CONTEXT_LENGTH",
     "CbgBenignDataset",
     "CbgDefenseDataset",
+    "CbgJointBatchDataset",
     "CbgPairedSafetyDataset",
     "DEFAULT_ALPACA_DATASET",
     "DEFAULT_BEVERTAILS_PATH",
     "DisjointSplitIndices",
     "SAFETY_PROMPT_TEMPLATE",
     "collate_cbg_defense_batch",
+    "collate_cbg_joint_batch",
     "collate_cbg_safety_batch",
     "construct_cbg_alpaca_dataset",
     "construct_cbg_beavertails_datasets",
@@ -659,6 +731,7 @@ __all__ = [
     "deterministic_disjoint_indices",
     "filter_beavertails_records",
     "load_beavertails_refusal_records",
+    "load_manifest_attack_records",
     "tokenize_paired_responses",
     "tokenize_prompt_response",
 ]
