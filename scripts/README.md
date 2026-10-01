@@ -6,7 +6,7 @@
 |---|---|---|
 | **1. Train** | Each scenario in turn: full-parameter CBG-HVP, 500 steps | both |
 | **2. Evaluate** | Base model + every trained scenario, before and after a harmful fine-tuning attack at each of 2e-5, 5e-5, 8e-5, 1e-4, 2e-4 (two metrics, below) | one model per H200, 2 in parallel |
-| **3. Upload** | Tables and records to a **private Hugging Face dataset repo**. No weights are uploaded. | none |
+| **3. Upload** | bf16 weights of every trained scenario to private **model repos** `ducthang1703/cbg-hvp-ablation-<scenario>`, then tables and records to a private **dataset repo** | none |
 
 The two metrics in stage 2 ([SEAM_EVALUATION_GUIDE.md](../SEAM_EVALUATION_GUIDE.md)):
 - **HS** (harmfulness): greedy generation on the test prompts, scored by the BeaverTails DeBERTa classifier.
@@ -91,8 +91,11 @@ The check passes when two things are true:
 | `DATA_DIR` / `OUT_DIR` | `data/seam4k-v1` / `results/ablation` | Data cache / all results |
 | `FINAL_LRS` | `2e-5,5e-5,8e-5,1e-4,2e-4` | Attack learning rates (SEAM Table 6) |
 | `FINAL_GPUS` | `0,1` | GPUs used in parallel for stage 2 |
-| `HF_UPLOAD` | `1` | Set to `0` to disable the upload (and the token check) |
+| `HF_UPLOAD` | `1` | Set to `0` to disable all uploads (and the token check) |
 | `HF_RESULTS_REPO` | `ducthang1703/cbg-hvp-ablation-results` | Private dataset repo for the results |
+| `UPLOAD_MODELS` | `1` | `1` uploads the weights of every trained scenario; `0` uploads results only |
+| `HF_MODEL_PREFIX` | `ducthang1703/cbg-hvp-ablation` | Model repos are named `<prefix>-<scenario>` |
+| `HF_DTYPE` | `bfloat16` | Dtype of the uploaded weights: 13.5 GB per model (`float32`: 27 GB, exactly as trained) |
 | `RUN_TESTS` | `1` | Run the CPU unit tests before starting |
 
 The ZS tasks are fixed to TruthfulQA-MC1, MMLU, HellaSwag and ARC-easy.
@@ -105,8 +108,8 @@ The ZS tasks are fixed to TruthfulQA-MC1, MMLU, HellaSwag and ARC-easy.
 | Stage 1: 8 × training at about 1.1 h | **about 9 h** |
 | Stage 2, per model: pre (HS + ZS), then 5 × (attack + HS + ZS) | about 2.5 h |
 | Stage 2: 9 models on 2 GPUs | **about 12.5 h** |
-| Stage 3: upload | a few minutes |
-| **Total** | **about 22 h** |
+| Stage 3: upload of 8 models (8 x 13.5 GB) + results | about 1-2 h, depending on upload bandwidth |
+| **Total** | **about 23-24 h** |
 
 To shorten stage 2, use `FINAL_LRS=5e-5,1e-4,2e-4`. That brings it to about 8 h.
 
@@ -133,7 +136,14 @@ The Hugging Face repo `ducthang1703/cbg-hvp-ablation-results` (dataset, private)
 - for each evaluated model (base included): `runs/<model>/attack-eval-test/attack_eval.json`;
 - a README that shows the table.
 
-It does not contain weights or console logs. The weights stay on the server in `runs/<scenario>/train/final/`.
+It does not contain weights or console logs.
+
+Each trained scenario also gets a private model repo `ducthang1703/cbg-hvp-ablation-<scenario>` (8 repos), with:
+- bf16 weights and tokenizer, loadable with `AutoModelForCausalLM.from_pretrained`;
+- `training/` (config, identity, metrics, per-step log);
+- a model card with the settings and the geometry change.
+
+Each upload is recorded in `runs/<scenario>/train/hf_upload.json`, and a model that is already uploaded is skipped on a rerun. The fp32 weights stay on the server in `runs/<scenario>/train/final/`.
 
 ## Reading the table (`summary_test.md`)
 

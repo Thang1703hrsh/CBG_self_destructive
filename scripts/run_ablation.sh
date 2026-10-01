@@ -8,7 +8,8 @@
 #     HS  greedy generation on the test prompts, BeaverTails DeBERTa classifier
 #     ZS  zero-shot mean acc of TruthfulQA-MC1, MMLU, HellaSwag, ARC-easy
 #   -> summary_test.{md,csv,json} (with the training geometry/losses of every scenario).
-# Stage 3: results (tables + records, no weights) -> private Hugging Face dataset repo HF_RESULTS_REPO.
+# Stage 3: Hugging Face, all private: the weights of every trained scenario (bf16) -> model repo
+#   HF_MODEL_PREFIX-<scenario>; then the results (tables + records) -> dataset repo HF_RESULTS_REPO.
 #
 # Finished trainings / evaluations are skipped and interrupted ones resume: just run the script again.
 #
@@ -16,7 +17,8 @@
 #   export HF_TOKEN=hf_xxx                       # Llama-2 access + WRITE access (results upload)
 #   nohup bash scripts/run_ablation.sh > ablation.log 2>&1 &     # keeps running after logout
 #   ONLY="ref beta0" bash scripts/run_ablation.sh
-#   HF_UPLOAD=0 bash scripts/run_ablation.sh     # no upload
+#   HF_UPLOAD=0 bash scripts/run_ablation.sh     # no upload at all
+#   UPLOAD_MODELS=0 bash scripts/run_ablation.sh # results only, no weights
 #
 # Outputs (OUT_DIR = results/ablation):
 #   summary_test.{md,csv,json}           the ablation table
@@ -39,6 +41,9 @@ FINAL_TASKS=truthfulqa_mc1,mmlu,hellaswag,arc_easy        # ZS (SEAM §5.1); fix
 FINAL_GPUS=${FINAL_GPUS:-0,1}
 HF_UPLOAD=${HF_UPLOAD:-1}
 HF_RESULTS_REPO=${HF_RESULTS_REPO:-ducthang1703/cbg-hvp-ablation-results}   # private dataset repo
+UPLOAD_MODELS=${UPLOAD_MODELS:-1}                                          # 1 = weights of every scenario
+HF_MODEL_PREFIX=${HF_MODEL_PREFIX:-ducthang1703/cbg-hvp-ablation}           # model repos <prefix>-<scenario>
+HF_DTYPE=${HF_DTYPE:-bfloat16}                                             # 13.5 GB per model (float32: 27 GB)
 BASE_RUN=base-llama2-7b-chat
 
 export PYTHONPATH=$ROOT USE_TF=0 TRANSFORMERS_NO_TF=1 TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=4 \
@@ -84,7 +89,7 @@ for entry in "${SCENARIOS[@]}"; do
 done
 if [[ "$HF_UPLOAD" == 1 ]]; then
   # The repo id is validated and the token must be able to write, otherwise the upload at the end would fail.
-  python -m src.experiments.hf_upload check "$HF_RESULTS_REPO" \
+  python -m src.experiments.hf_upload check "$HF_RESULTS_REPO" "$HF_MODEL_PREFIX-ref" \
       || { log "Hugging Face upload check failed (repo id / write token); or set HF_UPLOAD=0"; exit 1; }
 fi
 IFS=, read -r -a final_gpus <<< "$FINAL_GPUS"
@@ -95,7 +100,7 @@ if [[ "${free_gb:-0}" -lt 400 ]]; then
 fi
 log "GPUs: $gpus | config: $BASE_CONFIG | data: $DATA_DIR | out: $OUT_DIR"
 log "eval: greedy HS + ZS ($FINAL_TASKS), before and after attacks at $FINAL_LRS"
-log "HF upload: $([[ "$HF_UPLOAD" == 1 ]] && echo "results -> $HF_RESULTS_REPO (dataset, private)" || echo off)"
+log "HF upload: $([[ "$HF_UPLOAD" == 1 ]] && echo "results -> $HF_RESULTS_REPO (dataset)$([[ "$UPLOAD_MODELS" == 1 ]] && echo ", weights ($HF_DTYPE) -> $HF_MODEL_PREFIX-<scenario>"), all private" || echo off)"
 
 # ---------------------------------------------------------------------------
 # Data + model (once), tests
@@ -161,6 +166,16 @@ evaluate() {   # evaluate <name> <model dir> <gpu>
   log "[$name] eval done"
 }
 
+upload_model() {   # upload_model <name>: bf16 weights + training records + model card, one commit
+  local name=$1 repo="$HF_MODEL_PREFIX-$1" record="$RUNS_DIR/$1/train/hf_upload.json"
+  if [[ -f "$record" ]] && grep -q "\"repo_id\": \"$repo\"" "$record"; then
+    log "[$name] weights already on $repo"; return 0
+  fi
+  log "[$name] uploading weights ($HF_DTYPE) to $repo (private)"
+  python -m src.experiments.hf_upload model --run "$RUNS_DIR/$name/train" --repo "$repo" --dtype "$HF_DTYPE" \
+      --data "$DATA_DIR" --staging "$OUT_DIR/.hf-staging" || fail "upload of $name weights to $repo"
+}
+
 summary() {
   python -m src.experiments.ablation final --root "$RUNS_DIR" --base "$BASE_RUN" --out "$OUT_DIR" \
       --scenarios "$OUT_DIR/scenarios.tsv" > "$OUT_DIR/summary_test.log" 2>&1 \
@@ -223,9 +238,18 @@ log "ablation table: $OUT_DIR/summary_test.md"
 cat "$OUT_DIR/summary_test.md" 2>/dev/null
 
 # ---------------------------------------------------------------------------
-# Stage 3: results -> Hugging Face (private dataset repo; no weights)
+# Stage 3: Hugging Face (private): weights of every trained scenario, then the results
 # ---------------------------------------------------------------------------
 if [[ "$HF_UPLOAD" == 1 ]]; then
+  if [[ "$UPLOAD_MODELS" == 1 ]]; then
+    for entry in "${selected[@]}"; do
+      name=${entry%%|*}
+      [[ " ${stale[*]} " == *" $name "* ]] && continue
+      trained "$name" && upload_model "$name"
+    done
+    rm -rf "$OUT_DIR/.hf-staging"
+  fi
+  # Results last, so that they include the model upload records (runs/*/train/hf_upload.json).
   log "uploading results to $HF_RESULTS_REPO (dataset, private)"
   python -m src.experiments.hf_upload results --out "$OUT_DIR" --repo "$HF_RESULTS_REPO" \
       || fail "upload of results to $HF_RESULTS_REPO"
