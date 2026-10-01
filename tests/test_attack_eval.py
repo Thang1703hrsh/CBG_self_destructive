@@ -82,13 +82,24 @@ class AttackEvalTest(unittest.TestCase):
                     result = attack_eval.evaluate_model(root / "model", data, root / "out", **kwargs)
                     self.assertEqual(set(result["attacks"]), {"0.001", "0.0001"})
                     self.assertEqual(result["attacks"]["0.001"]["steps"], 2)
-                    self.assertEqual(result["pre"]["utility"], {"arc_easy": 0.5})
+                    self.assertEqual(result["pre"]["utility"], {"arc_easy": 0.5, "zs": 0.5})
                     self.assertLessEqual(result["post_harmfulness_mean"], 0.25)
                     count = len(calls)
                     attack_eval.evaluate_model(root / "model", data, root / "out", **kwargs)   # resume: nothing redone
                     self.assertEqual(len(calls), count)
                     with self.assertRaises(ValueError):
                         attack_eval.evaluate_model(root / "model", data, root / "out", **dict(kwargs, mode="test"))
+                    with self.assertRaises(ValueError):   # resumed with another decoding
+                        attack_eval.evaluate_model(root / "model", data, root / "out",
+                                                   **dict(kwargs, decoding="greedy"))
+                    self.assertEqual(result["pre"]["utility"]["zs"], 0.5)
+                    # Paper protocol: greedy HS, utility (+ ZS) after every attack.
+                    test = attack_eval.evaluate_model(root / "model", data, root / "test",
+                                                      **dict(kwargs, mode="test", learning_rates=[1e-3],
+                                                             post_utility=True, decoding="greedy"))
+                    self.assertEqual(test["decoding"], "greedy")
+                    self.assertEqual(test["attacks"]["0.001"]["utility"], {"arc_easy": 0.5, "zs": 0.5})
+                    self.assertFalse(test["pre"]["harmfulness"]["do_sample"])
             finally:
                 if runner:
                     runner.stop()

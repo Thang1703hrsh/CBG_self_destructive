@@ -6,7 +6,7 @@ import unittest
 
 import yaml
 
-from src.experiments.ablation import apply_overrides, markdown, summarize
+from src.experiments.ablation import apply_overrides, final_markdown, final_summary, markdown, summarize
 
 CONFIG = Path(__file__).resolve().parents[1] / "config" / "cbg_v2_llama2_7b_2xh200_fast_hvp.yaml"
 
@@ -59,6 +59,34 @@ class AblationTest(unittest.TestCase):
             self.assertIsNone(rows["k8"]["post_harmfulness_mean"])
             self.assertEqual(rows["beta0"]["overrides"], "method.beta=0.0")
             self.assertIn("**(best)**", markdown(summary))
+
+    def test_final_table_flags_compromised_attacks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            def evaluation(name, attacks):
+                path = root / name / "attack-eval-test"
+                path.mkdir(parents=True)
+                hs = [a[0] for a in attacks.values()]
+                (path / "attack_eval.json").write_text(json.dumps(dict(
+                    decoding="greedy",
+                    pre=dict(harmfulness=dict(score=.05), utility=dict(mmlu=.46, hellaswag=.57, zs=.515)),
+                    attacks={lr: dict(harmfulness=dict(score=h), utility=dict(mmlu=z, hellaswag=z, zs=z))
+                             for lr, (h, z) in attacks.items()},
+                    post_harmfulness_mean=sum(hs) / len(hs), post_harmfulness_max=max(hs))))
+            evaluation("base-llama2-7b-chat", {"2e-05": (.47, .51), "0.0001": (.79, .50)})
+            evaluation("ref", {"2e-05": (.03, .48), "0.0001": (.40, .25)})   # harmful but broken: not compromised
+            (root / "k8" / "train").mkdir(parents=True)                         # trained, test eval missing
+            summary = final_summary(root, "base-llama2-7b-chat", {"ref": []}, val_best="ref")
+            rows = {r["name"]: r for r in summary["rows"]}
+            self.assertEqual(list(rows), ["base-llama2-7b-chat", "ref"])
+            self.assertEqual(rows["base-llama2-7b-chat"]["compromised_lrs"], "2e-05 0.0001")
+            self.assertEqual(rows["ref"]["compromised"], 0)
+            self.assertAlmostEqual(rows["ref"]["post_zs_mean"], .365)
+            self.assertTrue(rows["ref"]["val_best"])
+            text = final_markdown(summary)
+            self.assertIn("ref **(val best)**", text)
+            self.assertIn("3.0 / 48.0", text)
+            self.assertLess(text.index("2e-05"), text.index("0.0001"))   # lrs in numeric order
 
 
 if __name__ == "__main__":

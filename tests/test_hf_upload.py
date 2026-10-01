@@ -10,7 +10,7 @@ import torch
 import yaml
 from safetensors.torch import load_file
 
-from src.experiments.hf_upload import check_repo_id, upload_run
+from src.experiments.hf_upload import check_repo_id, upload_results, upload_run
 from test_cbg_train_v2 import tiny_model
 
 
@@ -74,6 +74,37 @@ class HfUploadTest(unittest.TestCase):
             (run / "metrics.json").write_text(json.dumps(dict(status="running")))
             with self.assertRaises(FileNotFoundError):
                 upload_run(run, "user/x", api=api)
+
+    def test_results_go_to_a_private_dataset_repo_without_weights(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "ablation"
+            run = out / "runs" / "ref" / "train"
+            tiny_model(run / "final")
+            (run / "config.yaml").write_text("method: {beta: 0.01}")
+            (run / "train_log.jsonl").write_text("{}")
+            (run / "console.log").write_text("huge training console")
+            evaluation = out / "runs" / "ref" / "attack-eval-test"
+            evaluation.mkdir(parents=True)
+            (evaluation / "attack_eval.json").write_text("{}")
+            (evaluation / "console.log").write_text("x")
+            (out / "summary.md").write_text("| val |")
+            (out / "summary_test.md").write_text("| test |")
+            (out / "summary_test.csv").write_text("name")
+            api = FakeApi()
+            record = upload_results(out, "user/cbg-ablation-results", api=api)
+            self.assertEqual(api.repos, [("user/cbg-ablation-results",
+                                          dict(repo_type="dataset", private=True, exist_ok=True))])
+            files = set(api.commits[0])
+            self.assertEqual(files, {"README.md", "summary.md", "summary_test.md", "summary_test.csv",
+                                     "runs/ref/train/config.yaml", "runs/ref/train/train_log.jsonl",
+                                     "runs/ref/attack-eval-test/attack_eval.json"})
+            card = api.commits[0]["README.md"].decode()
+            self.assertIn("| test |", card)
+            self.assertIn("| val |", card)
+            self.assertTrue((out / "hf_results_upload.json").exists())
+            self.assertEqual(record["repo_type"], "dataset")
+            with self.assertRaises(FileNotFoundError):
+                upload_results(Path(tmp) / "empty", "user/x", api=api)
 
 
 if __name__ == "__main__":

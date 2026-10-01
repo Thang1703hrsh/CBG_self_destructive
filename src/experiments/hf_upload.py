@@ -116,6 +116,98 @@ def model_card(run_dir, repo_id, *, dtype, base_model, base_revision=None):
         "use is subject to its terms and Acceptable Use Policy.", ""])
 
 
+# Result files of an ablation (scripts/run_ablation.sh) that go to the results repository: small text/JSON
+# records only, no weights (models go to model repositories with upload_run).
+RESULT_PATTERNS = ("summary*.md", "summary*.csv", "summary*.json", "scenarios.tsv", "failures.txt", "tests.log",
+                   "runs/*/train/config.yaml", "runs/*/train/identity.json", "runs/*/train/metrics.json",
+                   "runs/*/train/train_log.jsonl", "runs/*/train/hf_upload.json",
+                   "runs/*/attack-eval-*/attack_eval.json")
+
+
+def results_card(out_dir, repo_id):
+    out_dir = Path(out_dir)
+    read = lambda name: (out_dir / name).read_text(encoding="utf-8").strip() if (out_dir / name).exists() else None
+    val, test = read("summary.md"), read("summary_test.md")
+    return "\n".join([
+        "---", yaml.safe_dump(dict(license="llama2", tags=["cbg", "safety", "ablation"]), sort_keys=False).strip(),
+        "---", "", f"# {repo_id.split('/')[-1]}", "",
+        "CBG-HVP hyperparameter ablation on Llama-2-7B-Chat (`scripts/run_ablation.sh`).", "",
+        "* `summary_test.*`: the ablation table. HS = greedy generation on the test prompts scored by the "
+        "BeaverTails DeBERTa classifier; ZS = zero-shot mean acc of TruthfulQA-MC1, MMLU, HellaSwag, ARC-easy; "
+        "both before and after a harmful fine-tuning attack at each learning rate (SEAM protocol).",
+        "* `runs/<scenario>/train/`: config, identity, metrics and per-step training log.",
+        "* `runs/<scenario>/attack-eval-*/attack_eval.json`: full evaluation records.", "",
+        *(["## Results", "", test, ""] if test else []),
+        *(["## Validation", "", val, ""] if val else [])])
+
+
+def upload_results(out_dir, repo_id, *, private=True, api=None, token=None, commit_message=None):
+    """Upload the ablation records under ``out_dir`` to a dataset repository, in one commit."""
+    from huggingface_hub import CommitOperationAdd, HfApi
+    out_dir = Path(out_dir)
+    check_repo_id(repo_id)
+    files = sorted({path for pattern in RESULT_PATTERNS for path in out_dir.glob(pattern) if path.is_file()})
+    if not files:
+        raise FileNotFoundError(f"no ablation results under {out_dir}")
+    api = api or HfApi(token=token)
+    repo_url = api.create_repo(repo_id, repo_type="dataset", private=private, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        card = Path(tmp) / "README.md"
+        card.write_text(results_card(out_dir, repo_id), encoding="utf-8")
+        operations = [CommitOperationAdd(path.relative_to(out_dir).as_posix(), str(path)) for path in files]
+        operations.append(CommitOperationAdd("README.md", str(card)))
+        info = api.create_commit(repo_id=repo_id, repo_type="dataset", operations=operations,
+                                 commit_message=commit_message or "CBG-HVP ablation results")
+    record = dict(repo_id=repo_id, repo_type="dataset", url=str(repo_url), private=private,
+                  commit=getattr(info, "oid", None), commit_url=getattr(info, "commit_url", None),
+                  files=[op.path_in_repo for op in operations])
+    write_json(out_dir / "hf_results_upload.json", record)
+    return record
+
+
+def main(argv=None):
+    """CLI used by scripts/run_ablation.sh (repo ids are validated before any upload)."""
+    import argparse
+    parser = argparse.ArgumentParser(description="Upload CBG runs / ablation results to the Hugging Face Hub")
+    sub = parser.add_subparsers(dest="command", required=True)
+    m = sub.add_parser("model", help="one finished run (<run>/train) to a model repository")
+    m.add_argument("--run", required=True)
+    m.add_argument("--repo", required=True)
+    m.add_argument("--dtype", default="bfloat16", choices=sorted(DTYPES))
+    m.add_argument("--data", help="prepared data dir (model_revision.json pins the base model)")
+    m.add_argument("--staging", help="scratch dir for the bf16 copy (default: system temp)")
+    r = sub.add_parser("results", help="ablation records to a dataset repository")
+    r.add_argument("--out", required=True)
+    r.add_argument("--repo", required=True)
+    c = sub.add_parser("check", help="validate repo ids and that the token can write")
+    c.add_argument("repos", nargs="+")
+    for p in (m, r):
+        p.add_argument("--public", action="store_true")
+    args = parser.parse_args(argv)
+    if args.command == "check":
+        from huggingface_hub import HfApi
+        for repo in args.repos:
+            check_repo_id(repo)
+        who = HfApi().whoami()
+        role = (who.get("auth", {}).get("accessToken", {}) or {}).get("role")
+        if role == "read":
+            raise SystemExit("HF token is read-only; create a token with write access")
+        print(f"HF user {who.get('name')} (token role: {role or 'unknown'}); repos ok: {' '.join(args.repos)}")
+        return
+    if args.command == "results":
+        record = upload_results(args.out, args.repo, private=not args.public)
+    else:
+        pinned = {}
+        if args.data and (Path(args.data) / "model_revision.json").exists():
+            pinned = json.loads((Path(args.data) / "model_revision.json").read_text(encoding="utf-8"))
+        if args.staging:
+            Path(args.staging).mkdir(parents=True, exist_ok=True)
+        record = upload_run(args.run, args.repo, private=not args.public, dtype=args.dtype,
+                            base_model=pinned.get("model"), base_revision=pinned.get("revision"),
+                            staging_dir=args.staging)
+    print(f"uploaded {len(record['files'])} files to {record['url']} (commit {record['commit']})")
+
+
 def upload_run(run_dir, repo_id, *, private=True, dtype="float32", base_model=None, base_revision=None,
                api=None, token=None, staging_dir=None, commit_message=None):
     """Upload <run_dir>/final plus training records and a model card; returns the upload record."""
@@ -150,3 +242,7 @@ def upload_run(run_dir, repo_id, *, private=True, dtype="float32", base_model=No
                   files=[op.path_in_repo for op in operations])
     write_json(run_dir / "hf_upload.json", record)
     return record
+
+
+if __name__ == "__main__":
+    main()
