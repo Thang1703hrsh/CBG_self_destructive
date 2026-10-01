@@ -10,13 +10,14 @@ import tempfile
 import unittest
 
 import torch
+from torch.func import grad,jvp
 
 from test_cbg_spec import fixture,fp64_norm,fp64_attention
 from src.cbg.spec import (_center,_forward,joint_batch,measurements,spec_precision,spec_training_gradient)
 from src.cbg.spec_hooks import spec_linear_modules
 from src.experiments.attacks import attack_gradient,benign_scores,nll,project_benign_span,rescale_swiglu
 from src.experiments.analysis import compromised,hs_score,zs_score,matched_correlations,summarize_seeds
-from src.experiments.geometry import radius_curve,evaluate_geometry,path_summary
+from src.experiments.geometry import _radius_chunks,radius_curve,evaluate_geometry,path_summary
 from src.experiments.protocol import digest,prepare_splits,select_configuration,validate_manifest,write_json
 from src.experiments.scenarios import standard_attacks,attack_catalog,load_protocol,search_candidates,ablations
 from src.experiments.runner import BatchStream,train_attack
@@ -231,7 +232,7 @@ class ScenarioNumericsTest(unittest.TestCase):
         self.model,self.batch,self.config=fixture()
 
     def test_raw_rho_estimator_matches_differentiable_dense_kernel(self):
-        config=replace(self.config,alpha=0.,beta=1.,drop_aln=True,k=1,objective="raw_rho",r=1e-5)
+        config=replace(self.config,alpha=0.,beta=1.,drop_aln=True,k=1,objective="raw_rho",r=1e-5,mu_mode="detached")
         batch=joint_batch(self.batch)
         params=OrderedDict(self.model.named_parameters())
         modules=spec_linear_modules(self.model)
@@ -301,16 +302,56 @@ class ScenarioNumericsTest(unittest.TestCase):
         curve=radius_curve(model,batch,replace(config,alpha=0.),[.001,.03],seed=2,perturb_precision="bf16")
         self.assertEqual(curve["perturb_precision"],"bf16")
         self.assertGreater(curve["curve"][0]["relative_error"],0)
+        calibrated=radius_curve(model,batch,replace(config,alpha=0.),[.001],seed=2,
+                                perturb_precision="bf16",exact_precision="fp32",output_deltas=())
+        self.assertEqual(calibrated["exact_precision"],"fp32")
+        self.assertTrue(-1 <= calibrated["curve"][0]["cosine"] <= 1)
 
     def test_radius_curve_and_fixed_sample_path(self):
         curve=radius_curve(self.model,self.batch,self.config,[1e-3,1e-4],seed=5)
         self.assertLess(curve["curve"][-1]["relative_error"],1e-6)
+        self.assertGreater(curve["curve"][-1]["cosine"],.999)
         first,samples=evaluate_geometry(self.model,[self.batch],self.config,seed=3)
         second,_=evaluate_geometry(self.model,[self.batch],self.config,seed=9,path_samples=samples)
         self.assertEqual(first["path_values"],second["path_values"])
         path=path_summary([first,second])
         self.assertEqual(path[-1]["benign_path_length"],0)
         self.assertIsNone(path[-1]["ratio"])
+
+    def test_radius_microbatches_match_full_batch_with_padding(self):
+        for name in ("harmful","safe","benign"):
+            repeats=4 if name!="benign" else 3
+            self.batch[name]={field:value.repeat((repeats,1))[:8]
+                              for field,value in self.batch[name].items()}
+        self.batch["benign"]["attention_mask"][0,-1]=0
+        self.batch["safe"]["response_mask"][1,-2]=False
+        joint=joint_batch(self.batch)
+        mask=(joint.response_mask[2*joint.m:,1:].bool() & joint.attention_mask[2*joint.m:,1:].bool())
+        samples=torch.ones(int(mask.sum()),dtype=torch.long)
+        weights=torch.randn(joint.m+joint.n,dtype=next(self.model.parameters()).dtype)
+        params=OrderedDict(self.model.named_parameters())
+        tangent=OrderedDict((name,torch.randn_like(value)) for name,value in params.items())
+        def full(p):
+            return weights @ measurements(_forward(self.model,joint,p),joint,samples=samples).values
+        parts=[]
+        for local,fixed,weight in _radius_chunks(self.batch,joint,samples,weights,8):
+            def scalar(p,local=local,fixed=fixed,weight=weight):
+                return weight @ measurements(_forward(self.model,local,p),local,samples=fixed).values
+            parts.append(scalar)
+        torch.testing.assert_close(sum(term(params) for term in parts),full(params),rtol=1e-12,atol=1e-12)
+        expected=jvp(grad(full),(params,),(tangent,))[1]
+        actual=[jvp(grad(term),(params,),(tangent,))[1] for term in parts]
+        for name in params:
+            torch.testing.assert_close(sum(row[name] for row in actual),expected[name],rtol=1e-10,atol=1e-12)
+        radii=[1e-4]
+        full=radius_curve(self.model,self.batch,self.config,radii,seed=5,microbatches=1)
+        chunked=radius_curve(self.model,self.batch,self.config,radii,seed=5,microbatches=8)
+        self.assertEqual(full["microbatches"],1)
+        self.assertEqual(chunked["microbatches"],8)
+        for baseline,actual in zip(full["curve"],chunked["curve"]):
+            for key in ("epsilon","relative_error","linearity_error","changed_weight_fraction"):
+                self.assertAlmostEqual(baseline[key],actual[key],delta=1e-7)
+        self.assertLess(chunked["curve"][0]["relative_error"],1e-5)
 
     def test_attack_gradient_reference_and_noise_reproducibility(self):
         recipe=dict(family="kl",regularization=.1,noise_sigma=.2,noise_scale="relative_gradient_rms")

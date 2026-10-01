@@ -1,4 +1,5 @@
-# Implementation-spec CBG. These are explicit, UNCALIBRATED pilot choices,
+# CBG method v2 (cbg_version=spec, not the legacy raw-rho cbg_version=v2).
+# These are explicit, UNCALIBRATED pilot choices,
 # not author-selected paper hyperparameters. Run T1--T8 and target-precision T6
 # before large-model training; this config does not establish a VRAM budget.
 TrainingArguments:
@@ -31,6 +32,15 @@ TrainingArguments:
 CbgArguments:
   method: cbg
   cbg_version: spec
+  spec_method_revision: cbg_v2
+  mu_mode: differentiated
+  estimator: shared_sign
+  capture_dtype: model  # FP32 capture for numerical qualification; bf16 is explicit compression
+  capture_offload: true
+  logprob_chunk_size: 128
+  lazy_period: 1
+  lazy_rescale: true
+  log_gradient_components: false # enable for diagnostic runs; costs extra model passes
   geometry_solver: exact
   spectral_derivative_backend: centered_fd
   parameter_space: full
@@ -45,8 +55,8 @@ CbgArguments:
   safety_batch_size: 8
   benign_batch_size: 32
   spectral_modes: 4
-  # Total sequence caps; safety has at most 512 response tokens plus context.
-  safety_max_length: 513
+  # Total sequence caps including prompt and response.
+  safety_max_length: 256
   benign_max_length: 128
   transformer_block_path: model.layers
   gram_max_bytes: 67108864

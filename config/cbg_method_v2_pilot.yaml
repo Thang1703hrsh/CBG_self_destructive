@@ -1,0 +1,75 @@
+# Native Trainer configuration for CBG_v2_method_spec.md, section 13.
+# NOT a Modal scenario protocol. Radius and compute precision are unqualified
+# candidates; run S0.2 before treating this as a production configuration.
+TrainingArguments:
+  output_dir: output/cbg_method_v2_pilot
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  max_steps: 500
+  learning_rate: 0.00002
+  weight_decay: 0.0
+  optim: adamw_torch
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  # Master weights stay FP32. CBG controls autocast through its own setting.
+  bf16: false
+  fp16: false
+  tf32: false
+  gradient_checkpointing: false
+  torch_compile: false
+  remove_unused_columns: false
+  dataloader_drop_last: true
+  dataloader_num_workers: 0
+  logging_steps: 1
+  save_steps: 100
+  save_total_limit: 2
+  save_only_model: false
+  report_to: none
+  seed: 42
+  data_seed: 42
+CbgArguments:
+  method: cbg
+  cbg_version: spec
+  spec_method_revision: cbg_v2
+  geometry_solver: exact
+  spectral_derivative_backend: centered_fd
+  parameter_space: full
+  reference_mode: separate_model
+  reference_device: cpu
+  model_name: meta-llama/Llama-3.2-1B-Instruct
+  beavertails_path: data/beavertails_with_refusals_train.json
+  defense_size: 4000
+  attack_size: 1000
+  split_seed: 2026
+  data_shuffle: true
+  safety_batch_size: 8
+  benign_batch_size: 32
+  spectral_modes: 4
+  safety_max_length: 256
+  benign_max_length: 128
+  transformer_block_path: model.layers
+  gram_max_bytes: 67108864
+  cbg_attention_implementation: eager
+  damping_mode: relative
+  spec_damping: relative
+  fisher: sampled
+  kl_direction: reference_to_current
+  xi: 0.001
+  kappa_mu: 1.0
+  relative_radius: 0.01
+  alpha: 1.0
+  beta: 0.01
+  beta_mode: fixed
+  mu_mode: differentiated
+  estimator: shared_sign
+  num_sign_draws: 1
+  detach_lambda: false
+  spec_perturb_precision: bf16
+  capture_dtype: bf16
+  capture_offload: true
+  logprob_chunk_size: 128
+  lazy_period: 1
+  lazy_rescale: true
+  # Measures separate components using extra passes; turn off for timing S12.
+  log_gradient_components: true

@@ -78,6 +78,8 @@ _SPEC_CONFIG_FIELDS = {
     "transformer_block_path", "kl_direction", "spec_damping", "fisher", "detach_lambda",
     "num_sign_draws", "spec_objective", "drop_aln", "scenario_manifest",
     "spec_solver", "spec_rayleigh_steps", "spec_rayleigh_step_size", "spec_perturb_precision",
+    "mu_mode", "capture_dtype", "capture_offload", "lazy_period", "lazy_rescale", "spec_method_revision",
+    "logprob_chunk_size", "log_gradient_components", "estimator",
 }
 
 
@@ -148,6 +150,15 @@ class CbgArguments:
     spec_rayleigh_steps: int = 0
     spec_rayleigh_step_size: float | None = None
     spec_perturb_precision: str = "fp32"
+    spec_method_revision: str = "cbg_v2"
+    mu_mode: str = "differentiated"
+    capture_dtype: str = "model"
+    capture_offload: bool = False
+    lazy_period: int = 1
+    lazy_rescale: bool = True
+    logprob_chunk_size: int = 128
+    log_gradient_components: bool = False
+    estimator: str = "shared_sign"
     spectral_derivative_backend: str = "centered_fd"
     # Research-only escape hatch for a guarded full-parameter feasibility
     # probe. Production V5 remains FP32 unless this is explicitly enabled.
@@ -244,6 +255,8 @@ class CbgArguments:
         if self.scenario_manifest and self.cbg_version != "spec":
             raise ValueError("scenario_manifest requires cbg_version=spec")
         if self.cbg_version == "spec":
+            if self.spec_method_revision != "cbg_v2":
+                raise ValueError("spec_method_revision must be cbg_v2; legacy spec checkpoints require the legacy code")
             if (self.parameter_space != "full" or self.geometry_solver != "exact"
                 or self.spectral_derivative_backend != "centered_fd" or self.beta_mode != "fixed"
                 or self.experimental_bf16_geometry or self.damping_mode != "relative"):
@@ -349,7 +362,11 @@ class CbgArguments:
                           num_sign_draws=self.num_sign_draws, objective=self.spec_objective,
                           drop_aln=self.drop_aln, solver=self.spec_solver,
                           rayleigh_steps=self.spec_rayleigh_steps, rayleigh_step_size=self.spec_rayleigh_step_size,
-                          perturb_precision=self.spec_perturb_precision)
+                          perturb_precision=self.spec_perturb_precision, mu_mode=self.mu_mode,
+                          capture_dtype=self.capture_dtype, capture_offload=self.capture_offload,
+                          lazy_period=self.lazy_period, lazy_rescale=self.lazy_rescale,
+                          logprob_chunk_size=self.logprob_chunk_size,
+                          log_gradient_components=self.log_gradient_components, estimator=self.estimator)
 
 
 def _require_int_at_least(value: int, minimum: int, name: str) -> None:
@@ -585,7 +602,7 @@ class CbgTrainer(Trainer):
             )
         if self.args.fp16:
             raise ValueError("the initial CBG trainer supports BF16 or FP32, not FP16")
-        if self.args.gradient_checkpointing:
+        if self.args.gradient_checkpointing and self.cbg_args.cbg_version != "spec":
             raise ValueError(
                 "gradient checkpointing is disabled for the initial torch.func CBG implementation"
             )
@@ -1206,6 +1223,7 @@ class CbgTrainer(Trainer):
         return reported_loss / divisor
 
     def _spec_training_step(self, model, inputs):
+        from dataclasses import replace
         from src.cbg.spec import _clock, spec_training_gradient
         model.train()
         if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
@@ -1220,12 +1238,17 @@ class CbgTrainer(Trainer):
         started = _clock(device)
         reference = self._reference_logits(model, batch["benign"]) if self.cbg_args.alpha else None
         reference_time = _clock(device) - started
-        result = spec_training_gradient(functional_model, batch, self.cbg_args.spec_config(),
+        config = self.cbg_args.spec_config()
+        active = self.state.global_step % config.lazy_period == 0
+        beta = config.beta * (config.lazy_period if config.lazy_rescale else 1) if active else 0.
+        result = spec_training_gradient(functional_model, batch, replace(config, beta=beta),
                                         reference_logits=reference)
         parameters = OrderedDict((name, p) for name, p in functional_model.named_parameters() if p.requires_grad)
         divisor = self._gradient_accumulation_divisor()
         self._backward_explicit_gradient(parameters, result.gradient, divisor=divisor)
         result.diagnostics["reference_time"] = reference_time
+        result.diagnostics["effective_beta"] = beta
+        result.diagnostics["lazy_period"] = config.lazy_period
         result.diagnostics["training_step_time"] = _clock(device) - started
         self._record_metrics({f"cbg/{name}": value for name, value in result.diagnostics.items()})
         return result.loss / divisor

@@ -1,4 +1,4 @@
-"""CBG log-eta implementation from CBG_implementation_spec.md.
+"""CBG log-eta implementation from CBG_v2_method_spec.md.
 
 No optimizer step is performed here. The returned gradient covers ALL trainable
 parameters; the admissible perturbation/Gram space contains only block Linears.
@@ -16,7 +16,7 @@ from torch.nn import functional as F
 
 from src.cbg.functionals import _extract_logits, _validate_sequence_batch
 from src.cbg.spec_hooks import SpecLinearHooks, spec_linear_modules
-from src.cbg.spec_spectral import solve_spec_spectrum, sign_scalarization
+from src.cbg.spec_spectral import solve_spec_spectrum, eigen_sign_scalarization, DegenerateGeometry
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,14 @@ class SpecConfig:
     rayleigh_steps: int = 0
     rayleigh_step_size: float | None = None
     perturb_precision: str = "fp32"
+    mu_mode: str = "differentiated"
+    capture_dtype: str = "model"
+    capture_offload: bool = False
+    lazy_period: int = 1
+    lazy_rescale: bool = True
+    logprob_chunk_size: int = 128
+    log_gradient_components: bool = False
+    estimator: str = "shared_sign"
 
     def __post_init__(self):
         for name in ("xi", "alpha", "beta", "kappa_mu", "r"):
@@ -49,7 +57,7 @@ class SpecConfig:
                 raise ValueError(f"{name} must be explicitly configured, finite and nonnegative")
             if name in {"kappa_mu", "r"} and value == 0:
                 raise ValueError(f"{name} must be positive")
-        for name in ("k", "gram_max_bytes", "num_sign_draws"):
+        for name in ("k", "gram_max_bytes", "num_sign_draws", "lazy_period"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -73,29 +81,42 @@ class SpecConfig:
             or not isinstance(self.rayleigh_steps, int) or self.rayleigh_steps < 1
             or self.rayleigh_step_size is None or not math.isfinite(self.rayleigh_step_size) or self.rayleigh_step_size <= 0):
             raise ValueError("Rayleigh ablation needs steps and an explicit positive step size")
-        if self.perturb_precision not in {"fp32", "bf16"}:
-            raise ValueError("perturb_precision must be fp32 or explicit bf16 ablation")
+        if self.perturb_precision not in {"fp32", "bf16", "tf32"}:
+            raise ValueError("perturb_precision must be fp32, bf16 or tf32")
+        if self.mu_mode not in {"differentiated", "detached"}:
+            raise ValueError("mu_mode must be differentiated or detached")
+        if self.capture_dtype not in {"model", "bf16"}:
+            raise ValueError("capture_dtype must be model or bf16")
+        if not isinstance(self.capture_offload, bool) or not isinstance(self.lazy_rescale, bool):
+            raise ValueError("capture_offload and lazy_rescale must be boolean")
+        if isinstance(self.logprob_chunk_size, bool) or not isinstance(self.logprob_chunk_size, int) or self.logprob_chunk_size < 0:
+            raise ValueError("logprob_chunk_size must be a nonnegative integer (0 disables chunking)")
+        if not isinstance(self.log_gradient_components, bool):
+            raise ValueError("log_gradient_components must be boolean")
+        if self.estimator != "shared_sign":
+            raise NotImplementedError("production v2 currently supports estimator=shared_sign only")
 
 
 @contextmanager
-def spec_precision(model):
+def spec_precision(model, precision_mode="fp32"):
     """Deterministic true FP32/64 forwards, restoring caller modes/precision."""
     tensors = list(model.parameters()) + list(model.buffers())
     if any(t.is_floating_point() and t.dtype not in (torch.float32, torch.float64) for t in tensors):
         raise ValueError("spec CBG requires FP32 master weights/compute (FP64 for validation)")
     devices = {p.device for p in model.parameters()}
-    if len(devices) != 1:
-        raise ValueError("spec CBG currently supports one model device")
+    if len({d.type for d in devices}) != 1:
+        raise ValueError("spec CBG requires all model devices to share one device type")
+    # Layer-split (model-parallel) placement is allowed; autocast is per type.
     device = next(iter(devices))
-    if getattr(model, "is_gradient_checkpointing", False):
-        raise ValueError("spec hooks require gradient checkpointing disabled")
+    # eval() disables HF checkpoint recomputation and dropout without changing
+    # the caller's checkpoint setting. Hooks still reject actual reused calls.
     modes = [(module, module.training) for module in model.modules()]
     precision = torch.get_float32_matmul_precision()
     cudnn_tf32 = torch.backends.cudnn.allow_tf32
     model.eval()
     try:
-        torch.set_float32_matmul_precision("highest")
-        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("high" if precision_mode == "tf32" else "highest")
+        torch.backends.cudnn.allow_tf32 = precision_mode == "tf32"
         with torch.enable_grad(), torch.autocast(device.type, enabled=False):
             yield
     finally:
@@ -141,9 +162,89 @@ class Measurements:
     samples: Tensor
 
 
+def _chunked_scores(active, targets, benign_positions, samples, reference_logits,
+                    fisher, kl_direction, generator, chunk_size):
+    """Exact full-vocabulary scores with rematerialized token-chunk softmax.
+
+    This bounds softmax intermediates, NOT model/output-head logits. Checkpoint
+    replay covers only this pure score function and never replays Linear hooks.
+    """
+    from torch.utils.checkpoint import checkpoint
+    count = int(benign_positions.sum())
+    if samples is not None and (samples.shape != (count,) or samples.dtype != torch.long):
+        raise ValueError("fixed Fisher samples must match the benign response token positions")
+    if reference_logits is not None and reference_logits.shape != (count, active.shape[-1]):
+        raise ValueError("reference must contain only benign response logits [tokens, vocabulary]")
+    observed_parts, sampled_parts, sample_parts = [], [], []
+    kl = active.new_zeros(())
+    offset = 0
+    for start in range(0, len(active), chunk_size):
+        x = active[start:start+chunk_size]
+        target = targets[start:start+chunk_size]
+        mask = benign_positions[start:start+chunk_size]
+        size = int(mask.sum())
+        with torch.no_grad():
+            fixed = (samples[offset:offset+size] if samples is not None else
+                     (torch.multinomial(x[mask].softmax(-1), 1, generator=generator).squeeze(1)
+                      if fisher == "sampled" and size else target[mask]))
+        reference = None if reference_logits is None else reference_logits[offset:offset+size].detach().to(x)
+        def score(value, target=target, mask=mask, fixed=fixed, reference=reference):
+            logp = value.log_softmax(-1)
+            observed = logp.gather(1, target[:, None]).squeeze(1)
+            benign = logp[mask]
+            sampled = benign.gather(1, fixed[:, None]).squeeze(1)
+            kl_sum = value.new_zeros(())
+            if reference is not None:
+                ref = reference.log_softmax(-1)
+                if kl_direction == "reference_to_current":
+                    kl_sum = (ref.exp()*(ref-benign)).sum()
+                elif kl_direction == "current_to_reference":
+                    kl_sum = (benign.exp()*(benign-ref)).sum()
+                else:
+                    raise ValueError("unsupported KL direction")
+            return observed, sampled, kl_sum
+        outputs = checkpoint(score, x, use_reentrant=False) if x.requires_grad else score(x)
+        observed_parts.append(outputs[0])
+        sampled_parts.append(outputs[1])
+        sample_parts.append(fixed)
+        kl = kl+outputs[2]/count
+        offset += size
+    return torch.cat(observed_parts), torch.cat(sampled_parts), kl, torch.cat(sample_parts).detach()
+
+
+@dataclass(frozen=True)
+class Totals:
+    """Whole-step counts, so a micro-batch's terms sum exactly to the full batch.
+
+    m, n: safety pairs / benign sequences in the full CBG batch (the 1/sqrt(m),
+    1/sqrt(n) weights). safe_tokens, benign_tokens: response-token counts of the
+    full batch (the denominators of the token means L_aln and L_bgn).
+    """
+    m: int
+    n: int
+    safe_tokens: int
+    benign_tokens: int
+
+
 def measurements(logits, batch: JointBatch, *, samples=None, reference_logits=None,
-                 fisher="sampled", kl_direction="reference_to_current", generator=None):
-    """Teacher-forced margins and SUM sampled scores, with global token losses."""
+                 fisher="sampled", kl_direction="reference_to_current", generator=None,
+                 logprob_chunk_size=0, totals: Totals | None = None):
+    """Teacher-forced margins and SUM sampled scores, with global token losses.
+
+    Without totals, batch is the whole CBG batch. With totals, batch is a
+    micro-batch (it may hold only safety pairs or only benign sequences) and
+    every returned term is that micro-batch's share of the full-batch value.
+    """
+    if batch.input_ids.device != logits.device:
+        # Layer-split models produce logits on the last device.
+        batch = JointBatch(*(t.to(logits.device) for t in (
+            batch.input_ids, batch.attention_mask, batch.response_mask, batch.seq_to_example)),
+            m=batch.m, n=batch.n)
+        samples = None if samples is None else samples.to(logits.device)
+    if totals is not None:
+        return _measurements_share(logits, batch, totals, samples=samples, reference_logits=reference_logits,
+                                   fisher=fisher, kl_direction=kl_direction, generator=generator,
+                                   logprob_chunk_size=logprob_chunk_size)
     mask = batch.response_mask[:, 1:].bool() & batch.attention_mask[:, 1:].bool()
     lengths = mask.sum(1)
     if bool((lengths <= 0).any()):
@@ -153,11 +254,20 @@ def measurements(logits, batch: JointBatch, *, samples=None, reference_logits=No
     active = logits[:, :-1][mask]
     if active.dtype in (torch.float16, torch.bfloat16):
         active = active.float()
-    logp = active.log_softmax(-1)
     targets = batch.input_ids[:, 1:][mask]
     sequence = torch.arange(len(lengths), device=logits.device)[:, None].expand_as(mask)[mask]
     benign_positions = sequence >= 2 * batch.m
     safe_positions = (sequence >= batch.m) & ~benign_positions
+    if logprob_chunk_size:
+        observed, sampled_scores, kl, samples = _chunked_scores(active, targets, benign_positions,
+            samples, reference_logits, fisher, kl_direction, generator, logprob_chunk_size)
+        sums = observed.new_zeros(len(lengths)).scatter_add(0, sequence, observed)
+        means = sums/lengths
+        margins = (means[:batch.m]-means[batch.m:2*batch.m])/math.sqrt(batch.m)
+        benign = sampled_scores.new_zeros(batch.n).scatter_add(
+            0, sequence[benign_positions]-2*batch.m, sampled_scores)/math.sqrt(batch.n)
+        return Measurements(torch.cat((margins, benign)), -observed[safe_positions].mean(), kl, samples)
+    logp = active.log_softmax(-1)
     observed = logp.gather(1, targets[:, None]).squeeze(1)
     sums = observed.new_zeros(len(lengths)).scatter_add(0, sequence, observed)
     means = sums / lengths
@@ -186,46 +296,90 @@ def measurements(logits, batch: JointBatch, *, samples=None, reference_logits=No
     return Measurements(torch.cat((margins, benign)), -observed[safe_positions].mean(), kl, samples.detach())
 
 
+def _measurements_share(logits, batch, totals, *, samples, reference_logits, fisher, kl_direction,
+                        generator, logprob_chunk_size):
+    mask = batch.response_mask[:, 1:].bool() & batch.attention_mask[:, 1:].bool()
+    lengths = mask.sum(1)
+    if bool((lengths <= 0).any()):
+        raise ValueError("each sequence must have at least one predicted response token")
+    if logits.shape[:2] != batch.input_ids.shape:
+        raise ValueError("logits and joint sequence shapes differ")
+    m, n = batch.m, batch.n
+    active = logits[:, :-1][mask]
+    if active.dtype in (torch.float16, torch.bfloat16):
+        active = active.float()
+    targets = batch.input_ids[:, 1:][mask]
+    sequence = torch.arange(len(lengths), device=logits.device)[:, None].expand_as(mask)[mask]
+    benign_positions = sequence >= 2 * m
+    safe_positions = (sequence >= m) & ~benign_positions
+    count = int(benign_positions.sum())
+    if not count:
+        reference_logits = None
+    chunk = logprob_chunk_size or len(active)
+    observed, sampled_scores, kl_mean, samples = _chunked_scores(
+        active, targets, benign_positions, samples, reference_logits, fisher, kl_direction,
+        generator, max(chunk, 1))
+    sums = observed.new_zeros(len(lengths)).scatter_add(0, sequence, observed)
+    means = sums / lengths
+    margins = (means[:m] - means[m:2*m]) / math.sqrt(totals.m)
+    benign = sampled_scores.new_zeros(n).scatter_add(
+        0, sequence[benign_positions] - 2*m, sampled_scores) / math.sqrt(totals.n)
+    alignment = (-observed[safe_positions].sum() / totals.safe_tokens if m
+                 else observed.new_zeros(()))
+    kl = kl_mean * (count / totals.benign_tokens) if count else observed.new_zeros(())
+    return Measurements(torch.cat((margins, benign)), alignment, kl, samples)
+
+
 def _forward(model, batch, parameters=None):
     kwargs = dict(input_ids=batch.input_ids, attention_mask=batch.attention_mask)
     output = model(**kwargs) if parameters is None else functional_call(model, parameters, (), kwargs)
     return _extract_logits(output)
 
 
-def _center(model, batch, config, modules, *, generator=None, samples=None, materialize=True, timings=None):
+def _center(model, batch, config, modules, *, generator=None, samples=None, materialize=True,
+            timings=None, return_cw=False, return_capture=False):
     def record(label, start):
         now = _clock(batch.input_ids.device)
         if timings is not None:
             timings[label] = timings.get(label, 0.) + now - start
         return now
     with SpecLinearHooks(modules, batch.seq_to_example, batch.attention_mask,
-                         xi=config.xi, max_bytes=config.gram_max_bytes, damping=config.damping) as hooks:
+                         xi=config.xi, max_bytes=config.gram_max_bytes, damping=config.damping,
+                         capture_dtype=config.capture_dtype, offload=config.capture_offload) as hooks:
         phase = _clock(batch.input_ids.device)
-        center = measurements(_forward(model, batch), batch, samples=samples,
-                              fisher=config.fisher, generator=generator)
+        with torch.autocast(batch.input_ids.device.type, dtype=torch.bfloat16,
+                            enabled=config.perturb_precision == "bf16"):
+            logits = _forward(model, batch)
+        center = measurements(logits, batch, samples=samples, fisher=config.fisher, generator=generator,
+                              logprob_chunk_size=config.logprob_chunk_size)
         seed = center.values.sum()
         phase = record("center_forward_time", phase)
         if hooks.backward_target is None:
             raise ValueError("CBG hooks did not capture a backward target")
-        # The hook contractions need output cotangents, not the returned
-        # parameter gradients. Targeting the first transformer activation
-        # traverses the same graph and fires every hook without allocating a
-        # full gradient tensor for each admissible weight.
-        torch.autograd.grad(seed, hooks.backward_target, retain_graph=materialize)
+        # Traverse output hooks once without allocating discarded weight grads.
+        torch.autograd.grad(seed, hooks.backward_target)
+        if hooks.captured_names() != set(modules):
+            raise ValueError("center backward missed an admissible Linear; incomplete Gram rejected")
+        samples = center.samples
+        hooks.backward_target = None
+        del seed, center, logits
         phase = record("gram_backward_time", phase)
         spectrum = solve_spec_spectrum(hooks.K, batch.m, config.k, kappa_mu=config.kappa_mu,
                                        objective=config.objective, solver=config.solver,
                                        rayleigh_steps=config.rayleigh_steps,
-                                       rayleigh_step_size=config.rayleigh_step_size, generator=generator)
+                                       rayleigh_step_size=config.rayleigh_step_size, generator=generator,
+                                       mu_mode=config.mu_mode)
         phase = record("spectral_solve_time", phase)
         if not materialize:
-            return spectrum, center.samples
-        signs = torch.randint(0, 2, (2, config.k), device=seed.device, generator=generator) * 2 - 1
-        cw, cotangent = sign_scalarization(spectrum, *signs)
+            return spectrum, samples
+        if return_capture:
+            return spectrum, samples, hooks
+        signs = torch.randint(0, 2, (len(spectrum.kernel),), device=batch.input_ids.device, generator=generator) * 2 - 1
+        cw, cotangent = eigen_sign_scalarization(spectrum, signs)
         hooks.materialize(cw, spectrum.A)
-        torch.autograd.grad(seed, hooks.backward_target)
-        record("direction_backward_time", phase)
-        return spectrum, center.samples, cotangent, hooks.w, hooks.d_lambda
+        record("direction_contraction_time", phase)
+        result = (spectrum, samples, cotangent, hooks.w, hooks.d_lambda)
+        return (*result, cw) if return_cw else result
 
 
 @dataclass(frozen=True)
@@ -241,15 +395,40 @@ def _clock(device):
     return time.perf_counter()
 
 
+def _plain_gradient(model, joint, config, parameters, reference_logits, samples, generator, *, skipped=False):
+    """Exact base-loss step for beta=0, lazy steps, or degenerate geometry."""
+    started = _clock(joint.input_ids.device)
+    with torch.autocast(joint.input_ids.device.type, dtype=torch.bfloat16,
+                        enabled=config.perturb_precision == "bf16"):
+        logits = _forward(model, joint)
+    values = measurements(logits, joint, samples=samples, reference_logits=reference_logits,
+                          fisher=config.fisher, kl_direction=config.kl_direction, generator=generator,
+                          logprob_chunk_size=config.logprob_chunk_size)
+    loss = (0. if config.drop_aln else 1.)*values.alignment + config.alpha*values.benign_kl
+    grads = torch.autograd.grad(loss, tuple(parameters.values()), allow_unused=True)
+    result = OrderedDict((name, torch.zeros_like(p) if g is None else g.detach())
+                         for (name, p), g in zip(parameters.items(), grads))
+    if not bool(torch.isfinite(loss)) or any(not bool(torch.isfinite(g).all()) for g in result.values()):
+        raise FloatingPointError("nonfinite CBG base loss/gradient")
+    return SpecStepResult(result, loss.detach(), dict(L_aln=values.alignment.detach(),
+        L_bgn=values.benign_kl.detach(), geometry_skipped=float(skipped), geometry_active=0.,
+        m=joint.m, n=joint.n, nan_flag=0., gradient_components_measured=0.,
+        step_time=_clock(joint.input_ids.device)-started,
+        peak_memory=torch.cuda.max_memory_allocated(joint.input_ids.device) if joint.input_ids.device.type == "cuda" else 0.))
+
+
 def spec_training_gradient(model, batch, config: SpecConfig, *, reference_logits=None,
-                           generator=None) -> SpecStepResult:
+                           generator=None, fixed_samples=None) -> SpecStepResult:
     """Sections 3--6. Never mutate live weights, .grad buffers or optimizer state."""
     if config.alpha and reference_logits is None:
         raise ValueError("positive alpha requires frozen reference logits")
     joint = joint_batch(batch)
     if config.k > joint.m:
         raise ValueError("k cannot exceed safety pair count")
-    parameters = OrderedDict((name, p) for name, p in model.named_parameters() if p.requires_grad)
+    all_parameters = OrderedDict(model.named_parameters())
+    parameters = OrderedDict((name, p) for name, p in all_parameters.items() if p.requires_grad)
+    if not parameters:
+        raise ValueError("CBG requires at least one trainable parameter")
     modules = spec_linear_modules(model, config.block_path)
     device = joint.input_ids.device
     started = _clock(device)
@@ -260,43 +439,57 @@ def spec_training_gradient(model, batch, config: SpecConfig, *, reference_logits
     # by one complete parameter tree, and copying the first endpoint would
     # transiently require two such trees.
     gradient = OrderedDict()
+    base_endpoint_gradient = OrderedDict()
     loss, diagnostics = None, {}
-    with spec_precision(model):
-        samples = None
+    with spec_precision(model, config.perturb_precision):
+        if config.beta == 0:
+            return _plain_gradient(model, joint, config, parameters, reference_logits, fixed_samples, generator)
+        # Diagnostic runs can freeze the sampled-Fisher token IDs across
+        # optimizer steps. Normal training still samples once per step.
+        samples = fixed_samples
+        phase = _clock(device)
+        try:
+            spectrum, samples, captures = _center(model, joint, config, modules,
+                generator=generator, samples=samples, timings=diagnostics, return_capture=True)
+        except DegenerateGeometry:
+            return _plain_gradient(model, joint, config, parameters, reference_logits, samples, generator, skipped=True)
+        diagnostics["center_time"] = _clock(device)-phase
         for draw in range(config.num_sign_draws):
             phase = _clock(device)
-            # Each extra draw recomputes the center to keep live memory bounded.
-            # Fisher samples remain fixed across ALL sign draws and endpoints.
-            spectrum, samples, cotangent, w, dl = _center(
-                model, joint, config, modules, generator=generator, samples=samples, timings=diagnostics)
-            diagnostics["center_time"] = diagnostics.get("center_time", 0.) + _clock(device) - phase
-            norm_sq = sum((value.double().square() / (
-                parameters[name].detach().double().square() + config.xi**2)).sum()
-                for name, value in w.items())
-            if not bool(torch.isfinite(norm_sq)) or not bool(norm_sq > 0):
-                raise FloatingPointError("RMS perturbation direction is zero/nonfinite")
+            signs = torch.randint(0, 2, (len(spectrum.kernel),), device=device, generator=generator)*2-1
+            cw, cotangent = eigen_sign_scalarization(spectrum, signs)
+            captures.materialize(cw, spectrum.A)
+            w, dl = captures.w, captures.d_lambda
+            if draw == config.num_sign_draws-1:
+                captures.captures.clear()
+            diagnostics["direction_contraction_time"] = diagnostics.get("direction_contraction_time", 0.) + _clock(device)-phase
+            norm_sq = cw @ spectrum.kernel @ cw
+            if not bool(torch.isfinite(norm_sq)) or bool(norm_sq < 0):
+                raise FloatingPointError("RMS perturbation norm is negative/nonfinite")
             dim = sum(value.numel() for value in w.values())
-            epsilon = config.r * math.sqrt(dim) / norm_sq.sqrt()
+            zero_direction = bool(norm_sq == 0)
+            epsilon = norm_sq.new_zeros(()) if zero_direction else config.r * math.sqrt(dim) / norm_sq.sqrt()
             base_loss = spectrum.log_eta.new_zeros(())
             phase = _clock(device)
             for sign in (1, -1):
                 # Only U is replaced. Other trainable leaves participate in the
                 # outer derivative and receive their full mixed-Hessian terms.
                 endpoint = OrderedDict((name, (
-                    p.detach() + sign * epsilon.to(p) * w[name]).requires_grad_(True)
-                    if name in w else p) for name, p in parameters.items())
+                    p.detach() + sign * epsilon.to(p) * w[name]).requires_grad_(p.requires_grad)
+                    if name in w else p) for name, p in all_parameters.items())
                 with torch.autocast(device.type, dtype=torch.bfloat16, enabled=config.perturb_precision == "bf16"):
                     endpoint_logits = _forward(model, joint, endpoint)
                 values = measurements(endpoint_logits, joint, samples=samples,
                                       reference_logits=reference_logits, fisher=config.fisher,
-                                      kl_direction=config.kl_direction)
+                                      kl_direction=config.kl_direction, logprob_chunk_size=config.logprob_chunk_size)
                 base = (0. if config.drop_aln else 1.) * values.alignment + config.alpha * values.benign_kl
-                omega = torch.dot(cotangent.to(values.values), values.values)
-                endpoint_loss = sign * config.beta / epsilon.to(omega) * omega + .5 * base
-                grads = torch.autograd.grad(endpoint_loss, tuple(endpoint.values()), allow_unused=True)
+                omega = torch.dot(cotangent, values.values.double())
+                curvature_scale = 0. if zero_direction else sign * config.beta / epsilon
+                endpoint_loss = curvature_scale * omega + .5 * base
+                grads = torch.autograd.grad(endpoint_loss, tuple(endpoint[name] for name in parameters), allow_unused=True)
                 with torch.no_grad():
                     scale = 1 / config.num_sign_draws
-                    for (name, _), part in zip(endpoint.items(), grads):
+                    for name, part in zip(parameters, grads):
                         if part is None:
                             continue
                         if name not in gradient:
@@ -311,10 +504,31 @@ def spec_training_gradient(model, batch, config: SpecConfig, *, reference_logits
                 base_loss += .5 * base.detach().double()
                 for label, value in (("L_aln", values.alignment), ("L_bgn", values.benign_kl)):
                     diagnostics[label] = diagnostics.get(label, 0.) + .5 * value.detach() / config.num_sign_draws
-                del endpoint, endpoint_logits, values, base, omega, endpoint_loss, grads
+                del endpoint_logits, values, base, omega, endpoint_loss, grads
+                if config.log_gradient_components:
+                    # Independent graph: do not retain the endpoint graph merely
+                    # to measure components. This is explicitly extra compute.
+                    with torch.autocast(device.type, dtype=torch.bfloat16, enabled=config.perturb_precision == "bf16"):
+                        base_logits = _forward(model, joint, endpoint)
+                    base_values = measurements(base_logits, joint, samples=samples,
+                        reference_logits=reference_logits, fisher=config.fisher,
+                        kl_direction=config.kl_direction, logprob_chunk_size=config.logprob_chunk_size)
+                    scalar = (0. if config.drop_aln else 1.)*base_values.alignment + config.alpha*base_values.benign_kl
+                    parts = torch.autograd.grad(scalar, tuple(endpoint[name] for name in parameters), allow_unused=True)
+                    for name, part in zip(parameters, parts):
+                        if part is not None:
+                            value = part.detach().to(device="cpu", dtype=torch.float64)*(.5/config.num_sign_draws)
+                            if name not in base_endpoint_gradient:
+                                base_endpoint_gradient[name] = value
+                            else:
+                                base_endpoint_gradient[name].add_(value)
+                    del base_logits, base_values, scalar, parts, part
+                del endpoint
             diagnostics["perturbed_time"] = diagnostics.get("perturbed_time", 0.) + _clock(device) - phase
             if not config.detach_lambda:
                 for name, value in dl.items():
+                    if name not in parameters:
+                        continue
                     if name not in gradient:
                         gradient[name] = torch.zeros_like(parameters[name])
                     gradient[name].add_(value, alpha=config.beta / config.num_sign_draws)
@@ -322,10 +536,30 @@ def spec_training_gradient(model, batch, config: SpecConfig, *, reference_logits
             loss = value if loss is None else loss + value
             diagnostics.update(spectrum.diagnostics())
             for label, value in (("epsilon", epsilon),
+                                 ("b_K_b", norm_sq),
                                  ("w_norm", sum(v.double().square().sum() for v in w.values()).sqrt()),
                                  ("d_lambda_norm", sum(v.double().square().sum() for v in dl.values()).sqrt())):
                 diagnostics[label] = diagnostics.get(label, 0.) + value / config.num_sign_draws
             del w, dl
+        captures.captures.clear()
+        if config.log_gradient_components:
+            curvature_sq = 0.
+            geometry_sq = 0.
+            for name, value in gradient.items():
+                geometry = value.detach().to(device="cpu", dtype=torch.float64)-base_endpoint_gradient.get(name, 0.)
+                geometry_sq += float(geometry.square().sum())
+                curvature = geometry
+                if not config.detach_lambda and name in captures.d_lambda:
+                    curvature -= config.beta*captures.d_lambda[name].detach().to(device="cpu", dtype=torch.float64)
+                curvature_sq += float(curvature.square().sum())
+            plain = _plain_gradient(model, joint, config, parameters, reference_logits, samples, generator)
+            diagnostics["base_gradient_norm"] = sum(float(g.double().square().sum()) for g in plain.gradient.values())**.5
+            diagnostics["base_endpoint_gradient_norm"] = sum(float(g.square().sum()) for g in base_endpoint_gradient.values())**.5
+            diagnostics["beta_curvature_norm"] = curvature_sq**.5
+            diagnostics["beta_geometry_norm"] = geometry_sq**.5
+            diagnostics["geometry_to_base_grad_ratio"] = (diagnostics["beta_geometry_norm"] /
+                diagnostics["base_gradient_norm"] if diagnostics["base_gradient_norm"] > 0 else -1.)
+            del plain, base_endpoint_gradient
     # Restore the exact model parameter order and explicit zeros for any
     # coordinates disconnected from the endpoint objective.
     gradient = OrderedDict((name, gradient[name] if name in gradient else torch.zeros_like(parameter))
@@ -347,6 +581,10 @@ def spec_training_gradient(model, batch, config: SpecConfig, *, reference_logits
                        ablation_rayleigh=float(config.solver == "rayleigh_K"),
                        ablation_bf16_perturb=float(config.perturb_precision == "bf16"),
                        num_sign_draws=config.num_sign_draws)
+    diagnostics.update(geometry_active=1., geometry_skipped=0., nan_flag=0.,
+                       gradient_components_measured=float(config.log_gradient_components),
+                       beta_d_lambda_norm=config.beta*diagnostics["d_lambda_norm"],
+                       fraction_below_xi=sum((module.weight.detach().abs() < config.xi).sum() for module in modules.values()) / sum(module.weight.numel() for module in modules.values()))
     return SpecStepResult(gradient, loss.detach(), diagnostics)
 
 
@@ -357,7 +595,7 @@ def measure_geometry(model, batch, *, config: SpecConfig, generator=None, sample
     """
     joint = joint_batch(batch)
     modules = spec_linear_modules(model, config.block_path)
-    with spec_precision(model):
+    with spec_precision(model, config.perturb_precision):
         spectrum, _ = _center(model, joint, config, modules, generator=generator,
                               samples=samples, materialize=False)
     return spectrum.diagnostics()

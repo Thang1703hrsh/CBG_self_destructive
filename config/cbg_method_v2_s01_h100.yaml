@@ -1,0 +1,38 @@
+# S0.1 correctness only. No optimizer steps, defense dataset, or attack runs.
+scenario: S0.1
+method_revision: cbg_v2
+gpu: H100
+model: meta-llama/Llama-3.2-1B-Instruct
+seed: 31415
+batch:
+  safety_pairs: 2
+  benign_sequences: 2
+  sequence_length: 8
+  response_tokens: 2
+  padding_tokens: 3
+method:
+  xi: 0.001
+  kappa_mu: 1.0
+  r: 0.000001
+  alpha: 1.0
+  beta: 0.01
+  k: 2
+  mu_mode: differentiated
+  estimator: shared_sign
+  perturb_precision: fp32
+  capture_dtype: model
+  capture_offload: true
+  gram_max_bytes: 67108864
+  logprob_chunk_size: 16
+checks:
+  gram_relative_error: 0.0001
+  direction_relative_error: 0.001
+  correction_relative_error: 0.001
+  base_gradient_relative_error: 0.00001
+  padding_relative_error: 0.0001
+  checkpoint_relative_error: 0.00001
+  hvp_radii: [0.000001, 0.00001, 0.0001]
+  hvp_relative_error: 0.05
+  hvp_microbatches: 2
+# L3 is a short-batch correctness check, NOT S0.2 calibration (16 draws on the
+# training geometry/precision). Passing it does not authorize pilot training.

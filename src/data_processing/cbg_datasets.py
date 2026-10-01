@@ -248,6 +248,14 @@ def _build_sequence(
     }
 
 
+def _prompt_budget(max_length: int, response_length: int, min_response_tokens: int | None) -> int:
+    if min_response_tokens is None:
+        return max(1, max_length - response_length)
+    if isinstance(min_response_tokens, bool) or not 1 <= min_response_tokens < max_length:
+        raise ValueError("min_response_tokens must lie in [1, max_length)")
+    return max_length - min(min_response_tokens, response_length)
+
+
 def tokenize_prompt_response(
     tokenizer: Any,
     prompt_text: str,
@@ -256,14 +264,19 @@ def tokenize_prompt_response(
     max_length: int = CONTEXT_LENGTH,
     append_eos: bool = False,
     add_bos: bool = True,
+    min_response_tokens: int | None = None,
 ) -> SequenceExample:
-    """Tokenize one conditional response with an explicit target-token mask."""
+    """Tokenize one conditional response with an explicit target-token mask.
+
+    By default the whole response is kept and only an overlong prompt is cut.
+    With ``min_response_tokens`` the prompt is kept (up to ``max_length`` minus
+    that many response tokens) and the response is truncated at its tail.
+    """
 
     prompt_ids = _prompt_token_ids(tokenizer, prompt_text, add_bos=add_bos)
     response_ids = _response_token_ids(tokenizer, response_text, append_eos=append_eos)
-    # Retain the response and the suffix of an overlong prompt.  Keeping the
-    # prompt suffix preserves the answer delimiter immediately before target 1.
-    prompt_budget = max(1, max_length - len(response_ids))
+    # Keeping the prompt suffix preserves the answer delimiter before target 1.
+    prompt_budget = _prompt_budget(max_length, len(response_ids), min_response_tokens)
     prompt_ids = prompt_ids[-prompt_budget:]
     return _build_sequence(
         tokenizer,
@@ -282,6 +295,7 @@ def tokenize_paired_responses(
     max_length: int = CONTEXT_LENGTH,
     append_eos: bool = False,
     add_bos: bool = True,
+    min_response_tokens: int | None = None,
 ) -> tuple[SequenceExample, SequenceExample]:
     """Tokenize a safety pair while preserving an identical prompt prefix.
 
@@ -293,7 +307,8 @@ def tokenize_paired_responses(
     prompt_ids = _prompt_token_ids(tokenizer, prompt_text, add_bos=add_bos)
     harmful_ids = _response_token_ids(tokenizer, harmful_response, append_eos=append_eos)
     safe_ids = _response_token_ids(tokenizer, safe_response, append_eos=append_eos)
-    prompt_budget = max(1, max_length - max(len(harmful_ids), len(safe_ids)))
+    prompt_budget = _prompt_budget(max_length, max(len(harmful_ids), len(safe_ids)),
+                                   min_response_tokens)
     shared_prompt_ids = prompt_ids[-prompt_budget:]
     harmful = _build_sequence(
         tokenizer,
@@ -308,6 +323,57 @@ def tokenize_paired_responses(
         max_length=max_length,
     )
     return harmful, safe
+
+
+def tokenize_seam_text(tokenizer: Any, prompt_text: str, full_text: str, *, max_length: int) -> SequenceExample:
+    """Tokenize exactly like SEAM: ``tokenizer(full_text, truncation=True, max_length)``.
+
+    The whole string is tokenized in one pass (BOS, no EOS) and truncated on the
+    right, so prompt + response share ``max_length``. Response tokens are those
+    after the tokenization of ``prompt_text``, which must be a token prefix of
+    the full string (checked; it holds for SentencePiece when the response
+    starts with a space or newline). If truncation removes the whole response,
+    the last kept token is used as the response position.
+    """
+    full = _prompt_token_ids(tokenizer, full_text, add_bos=True)
+    prompt = _prompt_token_ids(tokenizer, prompt_text, add_bos=True)
+    if full[:len(prompt)] != prompt:
+        raise ValueError("prompt tokens are not a prefix of the SEAM-formatted sequence")
+    full = full[:max_length]
+    # SEAM keeps sequences whose prompt alone fills max_length (its loss covers
+    # every token). Keep the same tokens; CBG measures their last kept token.
+    boundary = min(len(prompt), len(full) - 1)
+    if boundary < 1:
+        raise ValueError("a sequence needs a conditioning token and one predicted token")
+    padding = max_length - len(full)
+    response = [False] * boundary + [True] * (len(full) - boundary) + [False] * padding
+    input_ids = full + [_pad_token_id(tokenizer)] * padding
+    return {
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "attention_mask": torch.tensor([1] * len(full) + [0] * padding, dtype=torch.long),
+        "response_mask": torch.tensor(response, dtype=torch.bool),
+        "labels": torch.tensor([t if r else -100 for t, r in zip(input_ids, response)], dtype=torch.long),
+    }
+
+
+def seam_safety_texts(record: Mapping[str, Any]) -> tuple[str, str, str]:
+    """(prompt, harmful, safe) strings exactly as SEAM builds them.
+
+    Harmful: ``Question: {prompt}\\nAnswer:\\n{response}``. Safe: the ``refusal``
+    field VERBATIM, which in the RepNoise file is ``Question: {prompt}\\nAnswer: {refusal}``.
+    """
+    prompt = f"Question: {record['prompt']}\nAnswer:"
+    harmful = f"Question: {record['prompt']}\nAnswer:\n{record['response']}"
+    safe = str(record["refusal"])
+    if not safe.startswith(prompt):
+        raise ValueError("refusal field does not start with the SEAM prompt; CBG needs a shared prompt")
+    return prompt, harmful, safe
+
+
+def seam_benign_texts(record: Mapping[str, Any]) -> tuple[str, str]:
+    """(prompt, full) strings exactly as SEAM: ``Question: {instruction}\\n{input}\\nAnswer: {output}``."""
+    question = f"Question: {record.get('instruction', '')}\n{record.get('input', '')}\nAnswer:"
+    return question, f"{question} {record['output']}"
 
 
 def _extract_refusal_response(refusal: str, prompt: str) -> str:
@@ -396,7 +462,12 @@ class CbgPairedSafetyDataset(Dataset[PairedSafetyExample]):
         prompt_template: str = SAFETY_PROMPT_TEMPLATE,
         append_eos: bool = False,
         add_bos: bool = True,
+        min_response_tokens: int | None = None,
+        text_format: str = "cbg",
     ) -> None:
+        if text_format not in {"cbg", "seam"}:
+            raise ValueError("text_format must be cbg or seam")
+        self.text_format = text_format
         if source_indices is None:
             source_indices = tuple(range(len(records)))
         if len(records) != len(source_indices):
@@ -408,12 +479,20 @@ class CbgPairedSafetyDataset(Dataset[PairedSafetyExample]):
         self.prompt_template = prompt_template
         self.append_eos = append_eos
         self.add_bos = add_bos
+        self.min_response_tokens = min_response_tokens
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int) -> PairedSafetyExample:
         record = self.records[index]
+        if self.text_format == "seam":
+            prompt_text, harmful_text, safe_text = seam_safety_texts(record)
+            return {
+                "harmful": tokenize_seam_text(self.tokenizer, prompt_text, harmful_text, max_length=self.max_length),
+                "safe": tokenize_seam_text(self.tokenizer, prompt_text, safe_text, max_length=self.max_length),
+                "pair_id": self.source_indices[index],
+            }
         prompt = str(record["prompt"])
         harmful_response = str(record["response"]).strip()
         safe_response = _extract_refusal_response(str(record["refusal"]), prompt)
@@ -426,6 +505,7 @@ class CbgPairedSafetyDataset(Dataset[PairedSafetyExample]):
             max_length=self.max_length,
             append_eos=self.append_eos,
             add_bos=self.add_bos,
+            min_response_tokens=self.min_response_tokens,
         )
         return {
             "harmful": harmful,
@@ -446,19 +526,28 @@ class CbgBenignDataset(Dataset[SequenceExample]):
         prompt_template: str = BENIGN_PROMPT_TEMPLATE,
         append_eos: bool = False,
         add_bos: bool = True,
+        min_response_tokens: int | None = None,
+        text_format: str = "cbg",
     ) -> None:
+        if text_format not in {"cbg", "seam"}:
+            raise ValueError("text_format must be cbg or seam")
+        self.text_format = text_format
         self.records = records
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.prompt_template = prompt_template
         self.append_eos = append_eos
         self.add_bos = add_bos
+        self.min_response_tokens = min_response_tokens
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int) -> SequenceExample:
         record = self.records[index]
+        if self.text_format == "seam":
+            prompt_text, full_text = seam_benign_texts(record)
+            return tokenize_seam_text(self.tokenizer, prompt_text, full_text, max_length=self.max_length)
         instruction = str(record.get("instruction", ""))
         input_text = str(record.get("input", ""))
         output_text = str(record.get("output", "")).strip()
@@ -473,6 +562,7 @@ class CbgBenignDataset(Dataset[SequenceExample]):
             max_length=self.max_length,
             append_eos=self.append_eos,
             add_bos=self.add_bos,
+            min_response_tokens=self.min_response_tokens,
         )
 
 
@@ -734,4 +824,7 @@ __all__ = [
     "load_manifest_attack_records",
     "tokenize_paired_responses",
     "tokenize_prompt_response",
+    "tokenize_seam_text",
+    "seam_safety_texts",
+    "seam_benign_texts",
 ]

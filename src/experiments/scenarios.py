@@ -98,6 +98,7 @@ def defense_config(protocol, choices, *, model, seed, output_dir, pilot=False):
                 data_shuffle=True, reference_device=fixed.get("reference_device"),
                 **{key: fixed[key] for key in ("kl_direction","safety_batch_size","benign_batch_size",
                                               "spectral_modes","safety_max_length","benign_max_length")})
+    args.update(spec_method_revision="cbg_v2", mu_mode="differentiated")
     args.update(choices)
     CbgArguments(**args)
     train = dict(output_dir=str(output_dir), per_device_train_batch_size=1, gradient_accumulation_steps=1,
@@ -128,7 +129,8 @@ def search_candidates(protocol):
 
 def ablations(selected, protocol):
     """Native ablations; external solver/precision/unlearning adapters are explicit."""
-    result = {"i-raw_rho":dict(spec_objective="raw_rho",spectral_modes=1),
+    result = {"i-raw_rho":dict(spec_objective="raw_rho",spectral_modes=1,mu_mode="detached"),
+              "ix-detached-mu":dict(mu_mode="detached"),
               "ii-euclidean":dict(spec_damping="euclidean"),"iv-empirical":dict(fisher="empirical"),
               "viii-drop-aln":dict(drop_aln=True),"viii-drop-bgn":dict(alpha=0.)}
     result.update({f"iii-k{k}":dict(spectral_modes=k) for k in (1,2,4,8)})

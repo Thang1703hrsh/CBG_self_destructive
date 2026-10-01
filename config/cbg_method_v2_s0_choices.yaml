@@ -1,0 +1,19 @@
+# Modal S0 choices for NEW v2 qualification, not previously qualified settings.
+# Compatible with config/cbg_s0_modal_1b_h200_len256.yaml. Its existing radius
+# grid is a starting sweep; expand it if there is no adjacent low-error region.
+alpha: 1.0
+beta: 0.01
+kappa_mu: 1.0
+xi: 0.001
+relative_radius: 0.000001
+spec_method_revision: cbg_v2
+mu_mode: differentiated
+estimator: shared_sign
+num_sign_draws: 1
+spec_perturb_precision: fp32
+capture_dtype: model
+capture_offload: true
+logprob_chunk_size: 128
+lazy_period: 1
+lazy_rescale: true
+log_gradient_components: false

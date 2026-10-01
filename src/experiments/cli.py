@@ -4,7 +4,7 @@ Preparing plans never executes training, a model download, or a judge request.
 """
 import argparse
 import copy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import re
@@ -32,6 +32,8 @@ def load_choices(path):
              "drop_aln","fisher","num_sign_draws","detach_lambda","spectral_modes",
              "benign_batch_size","benign_max_length"}
     allowed.update({"spec_solver","spec_rayleigh_steps","spec_rayleigh_step_size","spec_perturb_precision"})
+    allowed.update({"mu_mode", "capture_dtype", "capture_offload", "lazy_period", "lazy_rescale", "spec_method_revision"})
+    allowed.update({"logprob_chunk_size", "log_gradient_components", "estimator"})
     if not isinstance(choices,dict) or set(choices)-allowed:
         raise ValueError("choices must contain only the scientific CBG settings, in YAML or JSON")
     return choices
@@ -64,7 +66,7 @@ def qualification_fingerprint(protocol):
     structural={k:protocol["defense"][k] for k in ("safety_batch_size","benign_batch_size",
         "spectral_modes","safety_max_length","benign_max_length","kl_direction")}
     manifest=read_json(protocol["manifest"])
-    return digest(dict(pilot_model=protocol["models"]["pilot"],pilot=protocol["pilot"],
+    return digest(dict(method_revision="cbg_v2", pilot_model=protocol["models"]["pilot"],pilot=protocol["pilot"],
                        structure=structural,manifest_sha256=manifest["sha256"],geometry=protocol["geometry"]))
 
 
@@ -103,8 +105,8 @@ def validate_pilot(protocol,verification,radius,log,output):
         raise ValueError("radius curve is for a different pilot/protocol")
     if curve.get("code_sha256")!=code_fingerprint() or curve.get("model_parameters",float("inf"))>3_500_000_000:
         raise ValueError("current radius report on the <=3B-class pilot is required")
-    if curve.get("perturb_precision")!="fp32":
-        raise ValueError("the main-method gate requires FP32; BF16 curves are ablations")
+    if curve.get("perturb_precision") not in {"fp32", "bf16", "tf32"}:
+        raise ValueError("radius report must declare a supported training precision")
     chosen=protocol["search"]["relative_radius"]
     threshold=number(protocol["pilot"]["max_fd_relative_error"],"pilot.max_fd_relative_error",minimum=1e-30)
     points=sorted(curve["curve"],key=lambda r:r["radius"])
@@ -121,10 +123,13 @@ def validate_pilot(protocol,verification,radius,log,output):
     pilot_config=yaml.safe_load(pilot_config_path.read_text(encoding="utf-8"))
     from src.core.cbg_trainer import CbgArguments
     cbg=CbgArguments(**pilot_config["CbgArguments"])
+    if curve.get("perturb_precision") != cbg.spec_perturb_precision:
+        raise ValueError("radius and pilot compute precision differ")
     if cbg.model_name!=protocol["models"]["pilot"] or asdict(cbg.spec_config())!=dict(curve["config"],r=chosen):
         raise ValueError("pilot training and radius qualification use different scientific settings")
     if (cbg.spec_solver!="exact" or cbg.spec_objective!="log_eta" or cbg.spec_damping!="relative"
-        or cbg.fisher!="sampled" or cbg.drop_aln or cbg.detach_lambda or cbg.spec_perturb_precision!="fp32"):
+        or cbg.fisher!="sampled" or cbg.drop_aln or cbg.detach_lambda
+        or cbg.mu_mode!="differentiated"):
         raise ValueError("qualify the main CBG method before running ablations")
     if any(getattr(cbg,key)!=protocol["defense"][key] for key in (
         "safety_batch_size","benign_batch_size","spectral_modes","safety_max_length","benign_max_length")):
@@ -267,6 +272,7 @@ def run_probe(protocol,checkpoint,choices_path,bank_path,output,*,device,radius=
         raise ValueError("probe tokenizer or data differs; never reuse token IDs across vocabularies")
     batches=[move_batch(batch,device) for batch in bank["batches"]]
     if radius:
+        config=replace(config,perturb_precision=perturb_precision)
         result=radius_curve(model,batches[0],config,protocol["pilot"]["radii"],seed=bank["seed"],perturb_precision=perturb_precision)
     else:
         fixed=torch.load(path_samples,map_location="cpu",weights_only=True) if path_samples else None
@@ -324,7 +330,7 @@ def main(argv=None):
             probe.add_argument("--"+key,required=True)
         probe.add_argument("--device",default="cuda:0")
         probe.add_argument("--path-samples")
-        probe.add_argument("--perturb-precision",choices=("fp32","bf16"),default="fp32")
+        probe.add_argument("--perturb-precision",choices=("fp32","bf16","tf32"),default="fp32")
     attack=sub.add_parser("attack")
     for key in ("checkpoint","scenario","attack-id","output","pool"):
         attack.add_argument("--"+key,required=True)

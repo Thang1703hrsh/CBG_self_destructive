@@ -130,7 +130,7 @@ class SpecTest(unittest.TestCase):
                 self.assertIsNotNone(hooks.backward_target)
                 torch.autograd.grad(v.sum(), hooks.backward_target, retain_graph=True)
                 torch.testing.assert_close(hooks.K, expected, rtol=1e-10, atol=1e-12)
-                q = solve_spec_spectrum(hooks.K, 2, 2, kappa_mu=.3)
+                q = solve_spec_spectrum(hooks.K, 2, 2, kappa_mu=.3, mu_mode="detached")
                 cw, _ = sign_scalarization(q, torch.tensor([1, -1]), torch.tensor([-1, -1]))
                 hooks.materialize(cw, q.A)
                 torch.autograd.grad(v.sum(), hooks.backward_target)
@@ -148,7 +148,7 @@ class SpecTest(unittest.TestCase):
         C = torch.randn(5, 9, dtype=torch.float64)
         lam_inv = theta.square() + .01
         K = (C * lam_inv.detach()) @ C.T
-        q = solve_spec_spectrum(K, 2, 2, kappa_mu=.3)
+        q = solve_spec_spectrum(K, 2, 2, kappa_mu=.3, mu_mode="detached")
         B = C[2:].T @ C[2:] + q.mu * torch.diag(lam_inv.detach().reciprocal())
         Gh = C[:2].T @ C[:2]
         chol = torch.linalg.cholesky(B)
@@ -176,7 +176,7 @@ class SpecTest(unittest.TestCase):
             return torch.sin(a @ p) + .2 * (a @ p).square()
         C = torch.autograd.functional.jacobian(values, theta)[:, :6]
         lam = theta[:6].detach().square() + .01
-        q = solve_spec_spectrum((C*lam)@C.T, 2, 2, kappa_mu=.3)
+        q = solve_spec_spectrum((C*lam)@C.T, 2, 2, kappa_mu=.3, mu_mode="detached")
         dl = torch.cat((-2*theta[:6].detach()*(C*(q.A@C)).sum(0), theta.new_zeros(1)))
         estimate = torch.zeros_like(theta)
         for signs in itertools.product((-1., 1.), repeat=4):
@@ -287,7 +287,7 @@ class SpecTest(unittest.TestCase):
         jac = jacobian_rows(current.values, self.params, create_graph=True)
         K = sum((jac[n].flatten(1)*(module.weight.square()+config.xi**2).flatten()) @ jac[n].flatten(1).T
                 for n,module in self.modules.items())
-        mu = (.3*K[2:,2:].trace()/3).detach()
+        mu = .3*K[2:,2:].trace()/3
         M = (K[:2,:2] - K[:2,2:] @ torch.linalg.solve(K[2:,2:]+mu*torch.eye(3), K[2:,:2]))/mu
         objective = (mu*torch.linalg.eigvalsh((M+M.T)/2)[-2:].sum()).log() - torch.linalg.eigvalsh(K[:2,:2])[-2:].sum().log()
         loss = current.alignment + config.alpha*current.benign_kl + config.beta*objective
@@ -297,11 +297,11 @@ class SpecTest(unittest.TestCase):
         def fixed_samples(*args, **kwargs):
             kwargs["samples"] = self.samples
             return original(*args, **kwargs)
-        for signs in itertools.product((0, 1), repeat=4):
+        for signs in itertools.product((0, 1), repeat=5):
             with patch("src.cbg.spec.measurements", side_effect=fixed_samples), patch(
-                "src.cbg.spec.torch.randint", return_value=torch.tensor(signs).reshape(2,2)):
+                "src.cbg.spec.torch.randint", return_value=torch.tensor(signs)):
                 result = spec_training_gradient(self.model, self.data, config, reference_logits=ref)
-                average += flatten(result.gradient)/16
+                average += flatten(result.gradient)/32
         self.assertLess(float((average-exact).norm()/exact.norm()), 1e-6)
 
     def test_T8_twenty_steps_decrease_geometry_with_bounded_losses(self):
@@ -322,6 +322,17 @@ class SpecTest(unittest.TestCase):
             self.assertLess(float(result.diagnostics["L_bgn"]), .1)
         after = measure_geometry(self.model, self.data, config=config, samples=self.samples)["log_eta_k"]
         self.assertLess(float(after), float(before))
+
+    def test_fixed_batch_geometry_only_uses_frozen_fisher_samples(self):
+        config = replace(self.cfg, alpha=0., drop_aln=True, num_sign_draws=4)
+        expected = config.beta * measure_geometry(
+            self.model, self.data, config=config, samples=self.samples)["log_eta_k"]
+        with patch("src.cbg.spec.torch.multinomial", side_effect=AssertionError("resampled Fisher")):
+            result = spec_training_gradient(self.model, self.data, config,
+                generator=torch.Generator().manual_seed(76), fixed_samples=self.samples)
+        torch.testing.assert_close(result.loss, expected, rtol=1e-10, atol=1e-12)
+        self.assertEqual(result.diagnostics["num_sign_draws"], 4)
+        self.assertEqual(result.diagnostics["ablation_drop_aln"], 1.)
 
 
 if __name__ == "__main__":
