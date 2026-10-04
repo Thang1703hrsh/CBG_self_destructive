@@ -1,4 +1,7 @@
 import argparse
+import json
+import os
+from pathlib import Path
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
@@ -22,6 +25,10 @@ class EvalArguments:
     attack: bool = field(default=True, metadata={"help": "Whether to HFA"})
     attack_dataset: bool = field(default=True, metadata={"help": "Whether to load attack dataset"})
     attack_size: int = field(default=1000, metadata={"help": "Number of examples for attack evaluation"})
+    data_path: str = field(
+        default="data/beavertails_with_refusals_train.json",
+        metadata={"help": "Path to attack BeaverTails JSON"},
+    )
     utility_tasks: List[str] = field(default_factory=lambda: ["mmlu"], 
                                     metadata={"help": "List of utility tasks to evaluate"})
     utility_batch_size: int = field(default=24, metadata={"help": "Batch size for utility task evaluation"})
@@ -34,6 +41,12 @@ class EvalArguments:
         metadata={"help": "WandB project name"}
     )
     lora_attack: bool = field(default=False, metadata={"help": "Whether to use LoRA"})
+    lora_attack_config: str = field(
+        default="default", metadata={"help": "LoRA config: default or ctrap"}
+    )
+    gpt_eval: bool = field(default=False, metadata={"help": "Run optional GPT-based harmfulness check"})
+    result_path: Optional[str] = field(default=None, metadata={"help": "Write HS/ZS metrics JSON here"})
+    test_size: int = field(default=100, metadata={"help": "BeaverTails test examples; 0 means all"})
 
 
 def main():
@@ -66,15 +79,28 @@ def main():
     except Exception as e:
         tokenizer = AutoTokenizer.from_pretrained(eval_args.tokenizer_name)
     tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(eval_args.model_name, torch_dtype=torch.bfloat16)
-    model.to("cuda:0")
+    model_load_kwargs = {"torch_dtype": torch.bfloat16}
+    if os.environ.get("SEAM_DIRECT_GPU_LOAD") == "1":
+        if not torch.cuda.is_available():
+            raise RuntimeError("SEAM_DIRECT_GPU_LOAD requires CUDA")
+        model_load_kwargs.update({"low_cpu_mem_usage": True, "device_map": {"": 0}})
+    model = AutoModelForCausalLM.from_pretrained(eval_args.model_name, **model_load_kwargs)
+    if os.environ.get("SEAM_DIRECT_GPU_LOAD") != "1":
+        model.to("cuda:0")
     harmful_dataset, harmless_dataset, test_dataset = construct_beavertails_dataset(
-            tokenizer, attack_size=eval_args.attack_size
+            tokenizer,
+            attack=eval_args.attack_dataset,
+            attack_size=eval_args.attack_size,
+            train_path=eval_args.data_path,
+            test_size=eval_args.test_size,
                 )
+
+    results = {"model_name": eval_args.model_name, "attack": eval_args.attack}
 
     if eval_args.pre_utility:
         clean_utility_score = {}
         utility_score = eval_utility(model, tokenizer, tasks=eval_args.utility_tasks, batch_size=eval_args.utility_batch_size)
+        results["pre_utility"] = utility_score
         try:
             for t in eval_args.utility_tasks:
                 clean_utility_score[t] = utility_score[t]["acc,none"]
@@ -87,10 +113,20 @@ def main():
     if eval_args.attack:
         if eval_args.lora_attack:
             print("Using LoRA attack")
-            config = LoraConfig(
-                inference_mode=False,
-                task_type=TaskType.CAUSAL_LM,
-            )
+            if eval_args.lora_attack_config == "ctrap":
+                config = LoraConfig(
+                    r=32, lora_alpha=4,
+                    target_modules=["q_proj", "k_proj", "v_proj"],
+                    lora_dropout=0, bias="none",
+                    inference_mode=False, task_type=TaskType.CAUSAL_LM,
+                )
+            elif eval_args.lora_attack_config == "default":
+                config = LoraConfig(
+                    inference_mode=False,
+                    task_type=TaskType.CAUSAL_LM,
+                )
+            else:
+                raise ValueError(f"Unsupported LoRA attack config: {eval_args.lora_attack_config}")
             model = get_peft_model(model, config)
             trainer = Trainer(
             model=model,
@@ -114,15 +150,19 @@ def main():
         test_dataset,
         batch_size=training_args.per_device_train_batch_size,)
     harmful_score = eval_harmfulness(model, tokenizer, test_dataloader)    
+    results["harmfulness"] = harmful_score
     print("Harmful score: ", harmful_score)
     wandb.log({"Harmful score": harmful_score})
-    harmful_score_gpt = eval_harmfulness_gpt(model, test_dataloader, tokenizer)
-    print("Harmful score GPT: ", harmful_score_gpt)
-    wandb.log({"Harmful score GPT": harmful_score_gpt})
+    if eval_args.gpt_eval:
+        harmful_score_gpt = eval_harmfulness_gpt(model, test_dataloader, tokenizer)
+        print("Harmful score GPT: ", harmful_score_gpt)
+        wandb.log({"Harmful score GPT": harmful_score_gpt})
+        results["harmfulness_gpt"] = harmful_score_gpt
 
     if eval_args.post_utility:
         clean_utility_score = {}
         utility_score = eval_utility(model, tokenizer, tasks=eval_args.utility_tasks, batch_size=eval_args.utility_batch_size)
+        results["post_utility"] = utility_score
         try:
             for t in eval_args.utility_tasks:
                 clean_utility_score[t] = utility_score[t]["acc,none"]
@@ -132,6 +172,11 @@ def main():
             print("Post utility score: ", utility_score)
             wandb.log({"Post utility score": utility_score})
 
+    if eval_args.result_path:
+        result_path = Path(eval_args.result_path)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(json.dumps(results, indent=2, default=str), encoding="utf-8")
+        print("Saved metrics:", result_path)
     wandb.finish()
 
 if __name__ == "__main__":

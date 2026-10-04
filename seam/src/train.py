@@ -1,9 +1,9 @@
 import argparse
-import json
 import os
-import time
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type, Union
+
+os.environ.setdefault("USE_TF", "0")  # This training entrypoint uses PyTorch only.
 
 import torch
 import wandb
@@ -11,6 +11,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from transformers.utils import requires_backends
 
 from src.core.trainer import SeamTrainer
+from src.core.numerics import collate_seam_batch
 from src.data_processing._datasets import construct_alpaca_dataset, construct_beavertails_dataset
 from src.utils.config import load_yaml_config, MyParser
 
@@ -40,13 +41,20 @@ class SeamArguments:
         metadata={"help": "Whether to use attack dataset"}
     )
     defense_size: int = field(
-        default=1000,
+        default=4000,
         metadata={"help": "Number of examples for defense"}
     )
-    include_test_dataset: bool = field(
-        default=False,
-        metadata={"help": "Tokenize BeaverTails test data during training startup"},
+    data_path: str = field(
+        default="data/beavertails_with_refusals_train.json",
+        metadata={"help": "Path to defense BeaverTails JSON"},
     )
+    benign_seed: int = field(
+        default=42,
+        metadata={"help": "Seed for selecting benign Alpaca examples"},
+    )
+    weight_dtype: str = field(default="float32", metadata={"help": "float32 or bfloat16 model weights"})
+    gradient_storage: str = field(default="cpu", metadata={"help": "cpu or gpu extra gradient buffers"})
+    optimizer_cpu_offload: bool = field(default=True, metadata={"help": "FP32 AdamW moments on CPU"})
     
     # Optimization parameters
     epsilon: float = field(
@@ -55,11 +63,11 @@ class SeamArguments:
     )
     alpha: float = field(
         default=1.0,
-        metadata={"help": "Weight for L_sd"}
+        metadata={"help": "Weight for L_up"}
     )
     beta: float = field(
-        default=0.001,
-        metadata={"help": "Weight for L_up"}
+        default=0.01,
+        metadata={"help": "Weight for L_sd"}
     )
 
 @dataclass
@@ -70,16 +78,13 @@ class MyTrainingArguments(TrainingArguments):
         The number of GPUs used for data paralleling.
 
         Note:
-            In default Trainer, this is the number of visiable GPUs. Here we use visiable GPUs-2 for data paralleling because we use 2 GPUs to store extra gradients.
-            if smaller base models are adopted, we can use 1 GPU for extra gradient transfer. And you can revise 2 to 1 in the code below.
+            Reserve two GPUs for gradient storage when available. With exactly two
+            GPUs, train on cuda:0 and store both gradient buffers on cuda:1.
         """
         requires_backends(self, ["torch"])
         if not hasattr(self, "_n_gpu"):
             _ = self._setup_devices
-        # The original 7B setup reserved two visible GPUs for auxiliary
-        # full-model gradient trees. Qwen2.5-3B fits with one auxiliary A100.
-        reserved = int(os.getenv("SEAM_GRADIENT_GPUS", "2"))
-        return max(1, self._n_gpu - reserved)
+        return max(1, self._n_gpu - 2)
 
 def main():
     parser = argparse.ArgumentParser(description="Simple config path parser")
@@ -96,6 +101,14 @@ def main():
         args=remaining_args,
         default_values=yaml_defaults,
     )
+    if seam_args.weight_dtype not in {"float32", "bfloat16"} or seam_args.gradient_storage not in {"cpu", "gpu"}:
+        raise ValueError("Invalid SEAM weight_dtype or gradient_storage")
+    if seam_args.weight_dtype == "float32" and (training_args.bf16 or training_args.fp16):
+        raise ValueError("FP32 SEAM finite differences require --bf16 false --fp16 false")
+    if seam_args.optimizer_cpu_offload and seam_args.weight_dtype != "float32":
+        raise ValueError("CPU AdamW requires FP32 model weights")
+    if training_args.tf32:
+        raise ValueError("Disable TF32 for SEAM finite-difference training")
 
     wandb.init(project=seam_args.wandb_project_name, name=seam_args.wandb_run_name, group="train")
     print(f"Using config from: {config_path.config}")
@@ -107,26 +120,19 @@ def main():
     except Exception as e:
         tokenizer = AutoTokenizer.from_pretrained(seam_args.tokenizer_name)
     tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(seam_args.model_name, torch_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(seam_args.model_name,
+                                               torch_dtype=getattr(torch, seam_args.weight_dtype))
     model.config.use_cache = False
 
     harmful_dataset, harmless_dataset, test_dataset = construct_beavertails_dataset(
         tokenizer,
         attack=seam_args.attack_dataset,
         defence_size=seam_args.defense_size,
-        load_test_dataset=seam_args.include_test_dataset,
+        train_path=seam_args.data_path,
     )
-    benign_dataset = construct_alpaca_dataset(tokenizer, retain_size=seam_args.defense_size)
-
-    def collate_fn(batch):
-        def pad_id(tensor):
-            tensor[tensor == tokenizer.pad_token_id] = -100
-            return tensor
-        return {
-            'input_ids': torch.stack([item['input_ids'] for item in batch]),
-            'attention_mask': torch.stack([item['attention_mask'] for item in batch]),
-            'labels': torch.stack([pad_id(item['input_ids']) for item in batch]),
-        }
+    benign_dataset = construct_alpaca_dataset(
+        tokenizer, retain_size=seam_args.defense_size, seed=seam_args.benign_seed
+    )
 
     trainer = SeamTrainer(
         model=model,
@@ -136,26 +142,9 @@ def main():
         tokenizer=tokenizer,
         align_dataset=harmless_dataset,
         benign_dataset=benign_dataset,
-        data_collator=collate_fn,
+        data_collator=collate_seam_batch,
     )
-    for device_index in range(torch.cuda.device_count()):
-        torch.cuda.reset_peak_memory_stats(device_index)
-    train_started = time.perf_counter()
-    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
-    torch.cuda.synchronize()
-    runtime = {
-        "wall_seconds": time.perf_counter() - train_started,
-        "peak_allocated_gib": [
-            torch.cuda.max_memory_allocated(index) / 1024**3
-            for index in range(torch.cuda.device_count())
-        ],
-        "peak_reserved_gib": [
-            torch.cuda.max_memory_reserved(index) / 1024**3
-            for index in range(torch.cuda.device_count())
-        ],
-    }
-    print("SEAM_RUNTIME " + json.dumps(runtime), flush=True)
-    wandb.log(runtime)
+    trainer.train()
     wandb.log({"Output dir": training_args.output_dir})
     wandb.finish()
 

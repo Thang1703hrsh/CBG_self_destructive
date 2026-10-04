@@ -1,0 +1,128 @@
+# ===== CBG select (500 steps): the cbg_final method, keeping models at steps 100, 250 and 500 =====
+# Checkpoint selection on the VALIDATION split (scripts/modal_cbg_v2_7b.py --stage select-pipeline):
+# lr 1e-4 attack on d_val_atk for each kept model; keep models whose pre-attack mean(MMLU, ARC-e) is within
+# 2 points of base; pick the lowest HS (ties: highest attack loss); only that model is evaluated on the test split.
+# ===== FAST CBG v2 + exact HVP — Llama-2-7B-Chat — 2×H200 =====
+# Same as cbg_v2_llama2_7b_2xh200_fast.yaml (the fast-r1e7 run) except the curvature term:
+#   method.curvature: hvp   exact Hessian-vector product by double backward, one pass in bf16,
+#                           instead of the central finite difference (two fp32 passes at radius r).
+# method.radius is used only by `--stage hvp-check` (FD at r/sqrt3, r, sqrt3 r against the HVP).
+# Run `--stage hvp-check` before training: it must report "passed": true.
+# Runner: src/cbg/train_v2.py   Launcher: scripts/modal_cbg_v2_7b.py
+model: meta-llama/Llama-2-7b-chat-hf   # SEAM's checkpoint; revision is pinned at `prepare`
+
+seeds:
+  seed: 42
+  data_split: 42        # SEAM: random.Random(42).shuffle(valid rows); Alpaca shuffled with benign_seed = 42
+  data_order: 43        # used only when data.order = reshuffle
+  y_hat_sampling: 44
+  sign_draws: 45
+  d_geo_y_hat: 1234     # D_geo batch i uses seed 1234 + i (same for every checkpoint)
+
+# Data prepared exactly like the SEAM main run (SEAM_DATA_PREPARATION.md); see src/experiments/seam_data.py.
+#   harmful  "Question: {prompt}\nAnswer:\n{response}"
+#   safe     the `refusal` field VERBATIM  (= "Question: {prompt}\nAnswer: {refusal}")
+#   benign   "Question: {instruction}\n{input}\nAnswer: {output}"
+#   each string tokenized in one pass (BOS, no EOS), right-truncated at 256 tokens in total.
+#   CBG's prompt x is the shared prefix "Question: {prompt}\nAnswer:"; everything after it is the response.
+data:
+  safety_source: https://raw.githubusercontent.com/domenicrosati/representation-noising/main/data/beavertails_with_refusals_train.json
+  safety_source_sha256: c3c92961d834afe3ecbfbfa29e87ca759b90a73498aaf807162328e0ebe8e4ee
+  extra_harmful_source: PKU-Alignment/BeaverTails 330k_train   # CBG-only pools, only if row 5000+ runs out
+  eval_source: PKU-Alignment/BeaverTails 30k_test             # SEAM filter, first test_size prompts
+  benign_source: yahma/alpaca-cleaned
+  harm_classifier: domenicrosati/deberta-v3-xsmall-beavertails-harmful-qa-classifier
+  text_format: seam
+  benign_shuffle: hf_dataset   # datasets.Dataset.shuffle(seed); python_random if SEAM used random.Random
+  order: sequential            # SEAM DataLoaders use shuffle=False
+  test_size: 100
+  sizes:
+    defense: 4000         # SEAM defense.json (rows 0..3999 after the shuffle)
+    attack: 1000          # SEAM attack.json  (rows 4000..4999)
+    benign: 4000          # SEAM benign (first 4000 after the Alpaca shuffle)
+    d_geo_safety: 64      # CBG only: 8 batches x m=8, from rows 5000+, prompt-disjoint
+    d_val_atk: 1000       # CBG only: beta selection
+    d_atk_10k: 10000      # CBG only: attack.json + 9000 prompt-disjoint rows (attacks #6-#11)
+    d_geo_benign: 256     # CBG only: Alpaca rows 4000..4255 of the same shuffle
+
+lengths:
+  safety: 256             # SEAM CONTEXT_LENGTH: whole string, right truncation
+  benign: 256             # SEAM uses 256 for benign too (the CBG spec suggests 128)
+  min_response_tokens: null   # not in SEAM; the text_format=seam path ignores it
+
+method:
+  alpha: 1.0
+  beta: 0.1               # strong geometry (beta 0.1 gave delta log eta -1.36); the cap keeps it stable
+  ul_weight: 0.0          # direction A: no unlearning loss (it did not move L_ul at weight 1 or 15)
+  geometry_start_step: 0
+  geometry_max_ratio: 1.0 # per tensor: ||beta grad log eta||_W <= ||grad (L_aln + alpha L_bgn)||_W
+  geometry_cap_mode: balance      # per-tensor weight rho = geometry_max_ratio from step 1 (beta sets direction only)
+  geometry_trajectory: [0.0, 1.0e-5]   # theta and theta' = theta - 1e-5 * sign(grad L_harm) (~25+ attack steps)
+  kappa_mu: 1.0
+  xi: 1.0e-3
+  k: 4
+  mu_mode: differentiated
+  benign_metric: sampled_fisher
+  estimator: shared_sign
+  num_sign_draws: 1       # 2 draws ~1.8x the CBG-step cost for only sqrt(2) less noise
+  lazy_period: 4          # CBG step every 4th step; with lazy_mode reuse its geometry is added on all 4 steps
+  lazy_mode: reuse        # beta*grad log eta of the CBG step is added on each of its 4 steps (no 4x spike
+                          # into Adam, no lost geometry at the lr=0 first step); rescale = spec section 9
+  lazy_rescale: true      # ignored with lazy_mode: reuse
+  geometry_cache_dtype: bf16    # 13.5 GB, alive only between CBG steps (not at the CBG-step peak)
+  geometry_clip_factor: 3.0     # cap ||beta grad log eta|| at 3x the median of the last 16; null = off
+  curvature: hvp          # fd = finite difference at `radius`; hvp = exact (no radius)
+  radius: 1.1e-7          # hvp-check only: the 7B plateau found by the radius scan (fast-r1e7)
+  kl_direction: reference_to_current   # KL(p_θ0 ‖ p_θ)
+
+batch:
+  m: 8
+  n: 32
+
+execution:
+  devices: 2
+  placement: layer_split          # replaces fsdp_full_shard (see review notes)
+  microbatch_tokens: 2048         # padded token slots per micro-batch; replaces activation checkpointing
+  plain_precision: bf16           # only used on lazy (non-CBG) steps
+  center_precision: bf16          # Gram/center pass under bf16 autocast (your compute_default)
+  perturb_precision: fp32         # FD passes of hvp-check / radius only
+  hvp_precision: tf32             # HVP training pass. Measured on 7B (hvp-r1e7, hvp-tf32), one curvature pass:
+                                  #   fp32 24.5 s, exact (FD at r within 1.7%, cos 0.9999)
+                                  #   tf32  6.8 s, 6.5% off fp32, cos 0.998   <- used
+                                  #   bf16  5.8 s, 75% off fp32, cos 0.74     (unusable)
+                                  #   FD (2 fp32 passes) 19.4 s
+  hvp_check_tolerance: 0.10       # hvp-check acceptance (default 0.05). Loosened for tf32 on purpose: its 6.5%
+  hvp_check_min_cosine: 0.995     # rounding error is small next to the single-sign-draw estimator noise
+                                  # (cbg_reference: mean relative error of one draw ~2-4x); validated end to end by
+                                  # comparing geo/log_eta_k with the CBG-FD run (fast-r1e7) at step 200.
+  hvp_microbatch_tokens: 1024     # double backward keeps the first backward's graph: ~2-3x activations
+  capture_dtype: bf16             # (X, Δ) storage
+  capture_offload: false          # keep (X, Δ) on GPU
+  contraction_tf32: true          # exact: bf16 captures are representable in TF32
+  restore: copy                   # exact restore of θ after the perturbed passes
+  gram_max_bytes: 4294967296      # row-chunk workspace for the per-example contractions
+  logprob_chunk_size: 256         # chunked fp32 log-softmax over the 32K vocabulary
+  deterministic_perturbed_passes: true
+
+optimizer:                        # SEAM-matched
+  name: adamw
+  fused: true
+  lr: 2.0e-5
+  steps: 500                      # SEAM budget: 4,000 pairs x 1 epoch at batch 8
+  scheduler: cosine
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  grad_clip: null                 # SEAM: max_grad_norm null (clipping at 1.0 froze L_ul in the pilot)
+
+logging:
+  geo_eval_every: 50
+  grad_ratio_every: 10            # unused with lazy_mode reuse: grad_ratio is logged free on every CBG step
+  checkpoint_every: 100           # resumable state (~81 GB); removed after the final save
+  keep_last_checkpoint: false
+  save_models_at: [100, 250]      # model snapshots for checkpoint selection (final = step 500)
+  # Utility gate: stop when the mean KL to theta_0 on benign data over the last 20 steps exceeds 0.3.
+  early_stop:
+    - step: 100
+      max_mean_l_bgn: 0.3
+    - step: 250
+      max_mean_l_bgn: 0.3

@@ -1,4 +1,5 @@
 import os
+import json
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
@@ -7,6 +8,7 @@ from torch import nn
 import wandb
 from transformers import Trainer
 from transformers.trainer import *
+from src.core.numerics import CPUAdamW, masked_causal_ce, parameter_perturbation
 
 
 class SeamTrainer(Trainer):
@@ -14,10 +16,26 @@ class SeamTrainer(Trainer):
         self.seam_args = seam_args  # custom args for training seam model
         self.align_dataset = align_dataset # dataset of harmful prompt - refusal response
         self.benign_dataset = benign_dataset # dataset of benign prompt - benign response
-        self.model_device_list, gradient_devices = self.gpu_id
-        self.grad_device1, self.grad_device2 = gradient_devices
+        self.grad_device1, self.grad_device2 = self.gpu_id[1] # Determain GPUs used for extra gradient transfer
+        self.model_device_list = self.gpu_id[0]  # Determine GPUs used for data parallel
         self.total_grad = {} # store the gradient for gradient accumulation
         super().__init__(*args, **kwargs)
+
+    def create_optimizer(self):
+        if not getattr(self.seam_args, "optimizer_cpu_offload", False):
+            return super().create_optimizer()
+        if self.optimizer is None:
+            decay_names = self.get_decay_parameter_names(self.model)
+            groups = [
+                {"params": [p for n, p in self.model.named_parameters()
+                            if p.requires_grad and ((n in decay_names) == decay)],
+                 "weight_decay": self.args.weight_decay if decay else 0.0}
+                for decay in (True, False)
+            ]
+            self.optimizer = CPUAdamW(groups, lr=self.args.learning_rate,
+                                      betas=(self.args.adam_beta1, self.args.adam_beta2),
+                                      eps=self.args.adam_epsilon)
+        return self.optimizer
 
 
     @property
@@ -27,20 +45,29 @@ class SeamTrainer(Trainer):
         Note:
             if smaller base models are adopted, we can use 1 GPU for extra gradient transfer. And you can revise the code below.
         """
-        num_gpus = torch.cuda.device_count()
-        reserved = int(os.getenv("SEAM_GRADIENT_GPUS", "2"))
-        if reserved not in (1, 2):
-            raise ValueError("SEAM_GRADIENT_GPUS must be 1 or 2")
-        if num_gpus <= reserved:
-            raise RuntimeError(
-                f"SEAM needs at least one model GPU plus {reserved} auxiliary "
-                f"gradient GPU(s), but only {num_gpus} CUDA device(s) are visible"
-            )
-        model_devices = list(range(num_gpus - reserved))
-        auxiliary = [f"cuda:{index}" for index in range(num_gpus - reserved, num_gpus)]
-        if reserved == 1:
-            auxiliary = [auxiliary[0], auxiliary[0]]
-        return model_devices, auxiliary
+        if getattr(self.seam_args, "gradient_storage", "gpu") == "cpu":
+            return list(range(max(1, torch.cuda.device_count() - 2))), ['cpu', 'cpu']
+        visible_devices = os.getenv("CUDA_VISIBLE_DEVICES")
+        if visible_devices:
+            device_list = visible_devices.split(',')
+            if len(device_list) >= 3:
+                first_gpu_id_list = list(range(len(device_list)-2))
+                last_two_gpus = [f'cuda:{len(device_list)-2}', f'cuda:{len(device_list)-1}']
+                return first_gpu_id_list, last_two_gpus
+            elif len(device_list) == 2:
+                return [0], ['cuda:1', 'cuda:1']
+            else:
+                raise RuntimeError("SEAM requires at least two visible GPUs")
+        else:
+            num_gpus = torch.cuda.device_count()
+            if num_gpus >= 3:
+                first_gpu_id_list = list(range(num_gpus-2))
+                last_two_gpus = [f'cuda:{num_gpus-2}', f'cuda:{num_gpus-1}']
+                return first_gpu_id_list, last_two_gpus
+            elif num_gpus == 2:
+                return [0], ['cuda:1', 'cuda:1']
+            else:
+                raise RuntimeError("SEAM requires at least two visible GPUs")
 
     def _wrap_model(self, model, training=True, dataloader=None):
         """
@@ -387,14 +414,11 @@ class SeamTrainer(Trainer):
                         #################################################
                         for name, param in (model.module.named_parameters() if hasattr(model, "module") else model.named_parameters()):
                             if param.requires_grad:
-                                try:
-                                    if param.grad is None:
-                                        param.grad = self.total_grad[name].to(param.data.device)
-                                    else:
-                                        param.grad.copy_(self.total_grad[name].to(param.data.device))
-                                    param.grad /= args.gradient_accumulation_steps
-                                except Exception as e:
-                                    print(f"Error occurred: {e}")
+                                gradient = self.total_grad[name]
+                                if not torch.isfinite(gradient).all():
+                                    raise FloatingPointError(f"Nonfinite accumulated gradient: {name}")
+                                param.grad = gradient.to(param.device, copy=True)
+                                param.grad /= args.gradient_accumulation_steps
                         self.total_grad.clear()
                         #############################################
 
@@ -620,34 +644,14 @@ class SeamTrainer(Trainer):
             lr (`float`):
                 The learning rate for the update.
         """
-        # Store original parameter states
-        original_state = {
-            name: param.data.clone().to(self.grad_device1)
-            for name, param in (model.module.named_parameters() if hasattr(model, "module") else model.named_parameters())
-        }
-                
-        try:
-            model.zero_grad()
-            with torch.no_grad():
-                # Apply temporary updates based on gradient projection
-                for name, param in (model.module.named_parameters() if hasattr(model, "module") else model.named_parameters()):
-                    if param.requires_grad == True:
-                        try:
-                            param.data.add_((grad_1[name]/grad_1_norm - cosine_similarity * grad_2[name]/grad_2_norm).to(param.data.device), alpha=lr)
-                        except:
-                            param.data += (lr * (grad_1[name]/grad_1_norm - cosine_similarity * grad_2[name]/grad_2_norm).to(param.data.device))
+        base = model.module if hasattr(model, "module") else model
+        with parameter_perturbation(base, grad_1, grad_2, grad_1_norm,
+                                    grad_2_norm, cosine_similarity, lr,
+                                    # The restore snapshot lives in host RAM: with BF16 weights on 2 GPUs the
+                                    # extra gradient buffers already fill cuda:1 (6 model-sized tensors).
+                                    storage_device="cpu") as stats:
+            self.perturbation_stats.append(stats)
             yield
-            
-        finally:
-            with torch.no_grad():
-                # Restore original parameter values
-                for name, param in (model.module.named_parameters() if hasattr(model, "module") else model.named_parameters()):
-                    if param.requires_grad:
-                        param.data.copy_(original_state[name], non_blocking=False)
-                    
-                # Clear gradients
-                model.zero_grad()
-            del original_state
 
     def get_grad(self, model, device, zero_grad=False):
         # Collect gradients from model parameters
@@ -655,7 +659,12 @@ class SeamTrainer(Trainer):
         for name, param in (model.module.named_parameters() if hasattr(model, "module") else model.named_parameters()):
             if param.requires_grad:
                 if param.grad is not None:
-                    grad[name] = param.grad.detach().clone().to(device)
+                    if not torch.isfinite(param.grad).all():
+                        raise FloatingPointError(f"Nonfinite gradient: {name}")
+                    # FP32 buffers in host RAM (corrected FP32 mode); on a GPU keep the gradient dtype, as SEAM's
+                    # original code (BF16 buffers: 6 model-sized FP32 tensors would not fit one 80 GB GPU).
+                    dtype = torch.float32 if str(device) == "cpu" else param.grad.dtype
+                    grad[name] = param.grad.detach().to(device, dtype=dtype, copy=True)
                 else:
                     grad[name] = torch.zeros_like(param.data, device=device)
         
@@ -684,6 +693,7 @@ class SeamTrainer(Trainer):
             `torch.Tensor`: The tensor with training loss on this batch.
         """
         model.train()
+        self.perturbation_stats = []
         for name, param in (model.module.named_parameters() if hasattr(model, "module") else model.named_parameters()):
             param.requires_grad = True
         if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
@@ -703,16 +713,17 @@ class SeamTrainer(Trainer):
                 loss = loss.mean()
 
             assert self.use_apex == False, "Apex is not supported in this method."
-            # Finally we need to normalize the loss for reporting
-            if not self.model_accepts_loss_kwargs and self.compute_loss_func is None:
-                loss = loss / self.args.gradient_accumulation_steps
+            if not torch.isfinite(loss).all():
+                raise FloatingPointError("Nonfinite SEAM loss")
 
             # Turning off loss scaling w.r.t. gradient accumulation when DeepSpeed is enabled
             # https://github.com/huggingface/transformers/pull/35808
             if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
                 kwargs["scale_wrt_gas"] = False
 
-            self.accelerator.backward(loss, **kwargs)
+            # SEAM averages its manually assembled gradients once, at optimizer
+            # step time. Cancel Accelerate's automatic accumulation division here.
+            self.accelerator.backward(loss * self.accelerator.gradient_accumulation_steps, **kwargs)
 
             return loss.detach()
 
@@ -739,6 +750,7 @@ class SeamTrainer(Trainer):
             loss_harmful = self.compute_loss(model, inputs, split = "harmful", num_items_in_batch=num_items_in_batch)
         clear_memory()
         loss_harmful = backward_hf(loss_harmful)
+        unlearning_loss_value = loss_harmful.item()
         harmful_grad  = self.get_grad(model = model, device = self.grad_device1,zero_grad=True)
 
         # Gradient of loss_up
@@ -746,6 +758,7 @@ class SeamTrainer(Trainer):
             loss_harmless = self.compute_loss(model, inputs, split = "harmless", num_items_in_batch=num_items_in_batch)
         clear_memory()
         loss_harmless = backward_hf(loss_harmless)
+        utility_loss_value = loss_harmless.item()
         harmless_grad = self.get_grad(model = model, device = self.grad_device1,zero_grad=True)
 
         # calculate the total loss
@@ -768,6 +781,7 @@ class SeamTrainer(Trainer):
             loss_harmful = self.compute_loss(model, inputs, split = "attack", num_items_in_batch=num_items_in_batch)
         clear_memory()
         loss_harmful = backward_hf(loss_harmful)
+        attack_loss_value = loss_harmful.item()
         harmful_grad = self.get_grad(model = model, device = self.grad_device1,zero_grad=True)
 
         # Benign gradient
@@ -775,15 +789,30 @@ class SeamTrainer(Trainer):
             loss_harmless = self.compute_loss(model, inputs, split = "benign", num_items_in_batch=num_items_in_batch)
         clear_memory()
         loss_harmless = backward_hf(loss_harmless)
+        benign_loss_value = loss_harmless.item()
         harmless_grad = self.get_grad(model = model, device = self.grad_device1,zero_grad=True)
 
 
         harmful_grad_norm = self.compute_l2_norm(harmful_grad)
-        wandb.log({"Harmful Gradient Norm": harmful_grad_norm.item()})
         harmless_grad_norm = self.compute_l2_norm(harmless_grad)
-        wandb.log({"Harmless Gradient Norm": harmless_grad_norm.item()})
         cosine_similarity = self.compute_cosine_similarity(harmful_grad, harmless_grad)
-        wandb.log({"Cosine Similarity": cosine_similarity.item()})
+        if wandb.run is not None:
+            wandb.log({"Harmful Gradient Norm": harmful_grad_norm.item(),
+                       "Harmless Gradient Norm": harmless_grad_norm.item(),
+                       "Cosine Similarity": cosine_similarity.item()})
+        loss_record = {
+            "step": self.state.global_step + 1,
+            "unlearning_loss": unlearning_loss_value,
+            "utility_loss": utility_loss_value,
+            "attack_sft_loss": attack_loss_value,
+            "benign_sft_loss": benign_loss_value,
+            "cosine_similarity": cosine_similarity.item(),
+            "harmful_gradient_norm": harmful_grad_norm.item(),
+            "benign_gradient_norm": harmless_grad_norm.item(),
+            "objective_proxy": unlearning_loss_value
+            + self.seam_args.alpha * utility_loss_value
+            + self.seam_args.beta * cosine_similarity.item(),
+        }
 
         # Harmful fine-tuning gradient after parameter pertubation
         with self.temporary_parameter_update(model, harmless_grad, harmful_grad, harmless_grad_norm, harmful_grad_norm, cosine_similarity, self.seam_args.epsilon):
@@ -802,18 +831,28 @@ class SeamTrainer(Trainer):
             harmless_grad_p  = self.get_grad(model = model, device = self.grad_device2,zero_grad=True)
 
         # calculate the total gradient
+        sd_squared_norm = 0.0
         for name, param in (model.module.named_parameters() if hasattr(model, "module") else model.named_parameters()):
             if param.requires_grad:
                 harmful_grad_p[name] = harmful_grad_p[name].to(harmful_grad[name].device)
                 harmless_grad_p[name] = harmless_grad_p[name].to(harmless_grad[name].device)
                 sld_weights = self.seam_args.beta / self.seam_args.epsilon
+                sd_gradient = sld_weights * ((harmful_grad_p[name] - harmful_grad[name])/harmful_grad_norm + (harmless_grad_p[name] - harmless_grad[name])/harmless_grad_norm)
+                sd_squared_norm += sd_gradient.square().sum(dtype=torch.float64).item()
                 if name not in self.total_grad.keys():
-                    self.total_grad[name] = sld_weights * ((harmful_grad_p[name] - harmful_grad[name])/harmful_grad_norm + (harmless_grad_p[name] - harmless_grad[name])/harmless_grad_norm) 
+                    self.total_grad[name] = sd_gradient
                 else:
-                    self.total_grad[name] += sld_weights * ((harmful_grad_p[name] - harmful_grad[name])/harmful_grad_norm + (harmless_grad_p[name] - harmless_grad[name])/harmless_grad_norm) 
+                    self.total_grad[name] += sd_gradient
+                del sd_gradient
                 del harmful_grad_p[name], harmless_grad_p[name], harmful_grad[name], harmless_grad[name]
         del harmful_grad_norm, harmless_grad_norm, harmful_grad_p, harmless_grad_p
         del harmless_grad, harmful_grad
+        loss_record.update(perturbations=self.perturbation_stats,
+                           weighted_sd_gradient_norm=sd_squared_norm ** 0.5)
+        os.makedirs(self.args.output_dir, exist_ok=True)
+        with open(os.path.join(self.args.output_dir, "loss_components.jsonl"), "a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(loss_record, allow_nan=False) + "\n")
+        print("SEAM_LOSS_JSON " + json.dumps(loss_record, allow_nan=False), flush=True)
         ####################################################################################
         del inputs
         clear_memory()
@@ -832,27 +871,17 @@ class SeamTrainer(Trainer):
     
     
     def compute_l2_norm(self, grad_dict):
-        return torch.sqrt(sum(torch.sum(g * g) for g in grad_dict.values()))
+        norm = torch.sqrt(sum(torch.sum(g.float() * g.float()) for g in grad_dict.values()))
+        if not torch.isfinite(norm) or norm <= 0:
+            raise FloatingPointError("SEAM gradient norm must be finite and positive")
+        return norm
 
     def masked_token_ce_loss(self,
         logits,
         labels,
         mask
     ):
-        # Shift so that tokens < n predict n
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        # shifted masks
-        shift_logit_mask = mask[..., :-1].contiguous()
-        expanded_mask = shift_logit_mask.unsqueeze(-1).expand(-1, -1, shift_logits.size(-1))
-        shift_label_mask = mask[..., 1:].contiguous()
-        shift_logits = shift_logits * expanded_mask
-        shift_labels = shift_labels * shift_label_mask
-        shift_labels[shift_labels == 0] = -100
-        shift_labels = shift_labels.type(torch.LongTensor).to(shift_logits.device)
-        loss_fct = torch.nn.CrossEntropyLoss()
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        return loss
+        return masked_causal_ce(logits, labels, mask)
     def ce_loss(self, logits, labels):
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()

@@ -3,6 +3,7 @@ import os
 os.environ.setdefault("USE_TF", "0")
 import json
 import math
+import statistics
 import random
 from pathlib import Path
 import tempfile
@@ -144,7 +145,7 @@ class TrainV2DryRun(unittest.TestCase):
                 self.assertTrue(all(r["geometry_applied"] == 1. for r in rows))
                 self.assertTrue(all(r["beta_effective"] == config["method"]["beta"] for r in rows))
                 cbg = [r for r in rows if r["cbg_step"]]
-                self.assertTrue(all("grad_ratio" in r and r["L_bgn"] >= 0 for r in cbg))
+                self.assertTrue(all("grad_ratio" in r and r["L_bgn"] >= -1e-6 for r in cbg))   # KL is 0 at step 1 up to rounding
                 self.assertFalse(any("grad_ratio" in r for r in rows if not r["cbg_step"]))
                 self.assertTrue(all(r["geometry_clip_scale"] == 1. for r in cbg))   # history < 4: no guard
                 state = torch.load(out / "checkpoint" / "state.pt", weights_only=True)
@@ -167,6 +168,296 @@ class TrainV2DryRun(unittest.TestCase):
                 config_path.write_text(yaml.safe_dump(bad), encoding="utf-8")
                 with self.assertRaises(ValueError):
                     run(config_path, root / "data", root / "bad", root / "model", stage="smoke")
+
+
+class EarlyStopGateTest(unittest.TestCase):
+    def test_gate_stops_without_final_and_never_resumes(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tiny_model(root / "model")
+            repnoise = [dict(prompt=f"q{i}", response="bad " * (i % 5 + 1), refusal=f"Question: q{i}\nAnswer: no",
+                             is_safe=False) for i in range(40)]
+            alpaca = [dict(instruction=f"do {i}", input="", output="ok " * (i % 7 + 1)) for i in range(40)]
+            sizes = dict(defense=8, attack=4, benign=12, d_geo_safety=4, d_val_atk=4, d_atk_10k=8, d_geo_benign=6)
+            evaluation = [dict(prompt="t2", is_safe=False, category={"self_harm": True})]
+            write_pools(build_pools(repnoise, [], evaluation, alpaca, sizes, seed=42), root / "data", {})
+            config = yaml.safe_load((Path(__file__).resolve().parents[1] / "config" /
+                                     "cbg_v2_llama2_7b_2xh200_hvp_b01_l4.yaml").read_text(encoding="utf-8"))
+            self.assertEqual((config["method"]["beta"], config["method"]["lazy_period"]), (0.1, 4))
+            config["lengths"].update(safety=48, benign=48)
+            config["batch"].update(m=2, n=3)
+            config["method"].update(k=2, lazy_period=2)   # tiny run: checkpoint_every 2 must be a multiple
+            config["execution"].update(devices=["cpu", "cpu"], microbatch_tokens=40, hvp_microbatch_tokens=40,
+                                       center_precision="fp32", hvp_precision="fp32", capture_dtype="model",
+                                       contraction_tf32=False, gram_max_bytes=1 << 20, plain_precision="fp32")
+            config["optimizer"].update(steps=6)
+            # An unreachable decrease: the gate at step 2 must stop the run.
+            config["logging"].update(geo_eval_every=2, grad_ratio_every=0, checkpoint_every=2,
+                                     early_stop=[dict(step=2, max_delta_log_eta=-100.)])
+            config_path = root / "config.yaml"
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+            with patch("transformers.AutoTokenizer.from_pretrained", return_value=Tokenizer()):
+                out = root / "train"
+                result = run(config_path, root / "data", out, root / "model", stage="train")
+                self.assertEqual((result["status"], result["step"]), ("early_stopped", 2))
+                rows = [json.loads(l) for l in (out / "train_log.jsonl").read_text().splitlines()]
+                self.assertEqual([r["step"] for r in rows], [0, 1, 2])
+                self.assertEqual(rows[2]["gate_passed"], 0.)
+                self.assertAlmostEqual(rows[2]["gate_delta_log_eta_k"],
+                                       rows[2]["geo/log_eta_k"] - rows[0]["geo/log_eta_k"])
+                self.assertFalse((out / "final").exists())
+                self.assertFalse((out / "checkpoint").exists())
+                self.assertEqual(json.loads((out / "metrics.json").read_text())["status"], "early_stopped")
+                again = run(config_path, root / "data", out, root / "model", stage="train", resume=True)
+                self.assertTrue(again["skipped"])
+                # A reachable threshold passes the gate and finishes normally.
+                config["logging"]["early_stop"] = [dict(step=2, max_delta_log_eta=100.)]
+                config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+                passed = run(config_path, root / "data", root / "pass", root / "model", stage="train")
+                self.assertEqual(passed["status"], "complete")
+                rows = [json.loads(l) for l in (root / "pass" / "train_log.jsonl").read_text().splitlines()]
+                self.assertEqual(rows[2]["gate_passed"], 1.)
+
+
+class UnlearningTrainTest(unittest.TestCase):
+    def test_ul_pilot_config_trains_with_seam_unlearning_loss(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tiny_model(root / "model")
+            repnoise = [dict(prompt=f"q{i}", response="bad " * (i % 5 + 1), refusal=f"Question: q{i}\nAnswer: no",
+                             is_safe=False) for i in range(40)]
+            alpaca = [dict(instruction=f"do {i}", input="", output="ok " * (i % 7 + 1)) for i in range(40)]
+            sizes = dict(defense=8, attack=4, benign=12, d_geo_safety=4, d_val_atk=4, d_atk_10k=8, d_geo_benign=6)
+            evaluation = [dict(prompt="t2", is_safe=False, category={"self_harm": True})]
+            write_pools(build_pools(repnoise, [], evaluation, alpaca, sizes, seed=42), root / "data", {})
+            config = yaml.safe_load((Path(__file__).resolve().parents[1] / "config" /
+                                     "cbg_v2_llama2_7b_2xh200_ul_b003_s100.yaml").read_text(encoding="utf-8"))
+            self.assertEqual((config["method"]["beta"], config["method"]["ul_weight"]), (0.03, 1.0))
+            config["lengths"].update(safety=48, benign=48)
+            config["batch"].update(m=2, n=3)
+            config["method"].update(k=2, lazy_period=2)
+            config["execution"].update(devices=["cpu", "cpu"], microbatch_tokens=40, hvp_microbatch_tokens=40,
+                                       center_precision="fp32", hvp_precision="fp32", capture_dtype="model",
+                                       contraction_tf32=False, gram_max_bytes=1 << 20, plain_precision="fp32")
+            config["optimizer"].update(steps=4)
+            config["logging"].update(geo_eval_every=2, checkpoint_every=2)
+            config_path = root / "config.yaml"
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+            with patch("transformers.AutoTokenizer.from_pretrained", return_value=Tokenizer()):
+                result = run(config_path, root / "data", root / "train", root / "model", stage="train")
+            self.assertEqual(result["status"], "complete")
+            rows = [json.loads(l) for l in (root / "train" / "train_log.jsonl").read_text().splitlines()]
+            trained = [r for r in rows if r["step"] > 0]
+            self.assertTrue(all(math.isfinite(r["L_ul"]) and r["L_ul"] < 0 for r in trained))   # -log(CE + 1)
+            self.assertTrue(all(math.isfinite(r["grad_norm_total"]) for r in trained))
+
+
+class MainMethodConfigTest(unittest.TestCase):
+    def run_tiny(self, name, root, **logging):
+        from unittest.mock import patch
+        tiny_model(root / "model")
+        repnoise = [dict(prompt=f"q{i}", response="bad " * (i % 5 + 1), refusal=f"Question: q{i}\nAnswer: no",
+                         is_safe=False) for i in range(40)]
+        alpaca = [dict(instruction=f"do {i}", input="", output="ok " * (i % 7 + 1)) for i in range(40)]
+        sizes = dict(defense=8, attack=4, benign=12, d_geo_safety=4, d_val_atk=4, d_atk_10k=8, d_geo_benign=6)
+        evaluation = [dict(prompt="t2", is_safe=False, category={"self_harm": True})]
+        write_pools(build_pools(repnoise, [], evaluation, alpaca, sizes, seed=42), root / "data", {})
+        config = yaml.safe_load((Path(__file__).resolve().parents[1] / "config" /
+                                 f"cbg_v2_llama2_7b_2xh200_{name}.yaml").read_text(encoding="utf-8"))
+        config["lengths"].update(safety=48, benign=48)
+        config["batch"].update(m=2, n=3)
+        config["method"].update(k=2, lazy_period=2)
+        config["execution"].update(devices=["cpu", "cpu"], microbatch_tokens=40, hvp_microbatch_tokens=40,
+                                   center_precision="fp32", hvp_precision="fp32", capture_dtype="model",
+                                   contraction_tf32=False, gram_max_bytes=1 << 20, plain_precision="fp32")
+        config["optimizer"].update(steps=4)
+        config["logging"].update(geo_eval_every=2, checkpoint_every=2, **logging)
+        config_path = root / "config.yaml"
+        config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+        with patch("transformers.AutoTokenizer.from_pretrained", return_value=Tokenizer()):
+            result = run(config_path, root / "data", root / "train", root / "model", stage="train")
+        rows = [json.loads(l) for l in (root / "train" / "train_log.jsonl").read_text().splitlines()]
+        return result, rows, config
+
+    def test_utility_gate_stops_on_large_benign_kl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, rows, _ = self.run_tiny("cbg_ul", Path(tmp), early_stop=[dict(step=2, max_mean_l_bgn=-1.)])
+            self.assertEqual((result["status"], result["step"]), ("early_stopped", 2))
+            self.assertIn("mean L_bgn", result["reasons"][0])
+            self.assertAlmostEqual(rows[-1]["gate_mean_l_bgn"], statistics.mean(r["L_bgn"] for r in rows[1:3]))
+            self.assertFalse((Path(tmp) / "train" / "final").exists())
+
+    def test_main_and_ablation_configs_differ_only_in_beta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, rows, config = self.run_tiny("ul_only", Path(tmp), early_stop=[dict(step=2, max_mean_l_bgn=1e9)])
+            self.assertEqual((config["method"]["beta"], config["method"]["ul_weight"]), (0.0, 1.0))
+            self.assertEqual(result["status"], "complete")
+            self.assertTrue(all("L_ul" in r and not r.get("geometry_applied") for r in rows if r["step"] > 0))
+        main, ablation = [yaml.safe_load((Path(__file__).resolve().parents[1] / "config" /
+                                          f"cbg_v2_llama2_7b_2xh200_{n}.yaml").read_text(encoding="utf-8"))
+                          for n in ("cbg_ul", "ul_only")]
+        main["method"].pop("beta"), ablation["method"].pop("beta")
+        self.assertEqual(main, ablation)
+
+
+class TwoStagePilotTest(unittest.TestCase):
+    def test_geometry_starts_late_and_is_capped_by_the_rest_of_the_gradient(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            helper = MainMethodConfigTest()
+            _, rows, config = helper.run_tiny("cbg_ul_pilot", Path(tmp), early_stop=[])
+            self.assertEqual(config["method"]["geometry_start_step"], 40)
+        with tempfile.TemporaryDirectory() as tmp:
+            # Start geometry at step 2 of 4 on the tiny model; cap at 0.5 x the rest of the gradient.
+            import yaml as _yaml
+            from unittest.mock import patch
+            root = Path(tmp)
+            _, rows, config = helper.run_tiny("cbg_ul_pilot", root, early_stop=[])
+            config["method"].update(geometry_start_step=2, geometry_max_ratio=0.5, beta=50.)
+            config_path = root / "config2.yaml"
+            config_path.write_text(_yaml.safe_dump(config), encoding="utf-8")
+            with patch("transformers.AutoTokenizer.from_pretrained", return_value=Tokenizer()):
+                run(config_path, root / "data", root / "train2", root / "model", stage="train")
+            rows = [json.loads(l) for l in (root / "train2" / "train_log.jsonl").read_text().splitlines()]
+            trained = [r for r in rows if r["step"] > 0]
+            self.assertTrue(all(r["geometry_applied"] == 0. for r in trained[:2]))   # steps 1-2: UL stage
+            self.assertTrue(all(r["geometry_applied"] == 1. for r in trained[2:]))
+            self.assertTrue(all(r["grad_norm_ul"] > 0 for r in trained))
+            for r in trained[2:]:
+                # total <= rest + 0.5 * rest by the triangle inequality, and the large beta forces the cap
+                self.assertLessEqual(r["grad_norm_total"], 1.5 * r["grad_norm_base"] * (1 + 1e-6))
+            self.assertTrue(any(r.get("geometry_cap_scale", 1.) < 1. for r in trained[2:]))
+
+
+class PerTensorCapTest(unittest.TestCase):
+    def test_each_tensor_geometry_is_capped_by_its_own_rest_gradient(self):
+        from src.cbg.train_v2 import GeometryCache
+        a, b = torch.nn.Parameter(torch.zeros(3)), torch.nn.Parameter(torch.zeros(2))
+        model = torch.nn.Module()
+        model.a, model.b = a, b
+        a.grad, b.grad = torch.tensor([3., 4., 0.]), torch.tensor([10., 0.])      # geometry: norms 5 and 10
+        cache = GeometryCache(torch.float32)
+        cache.capture(model, norm=(25. + 100.) ** .5)
+        a.grad, b.grad = torch.tensor([0., 0., 1.]), torch.tensor([0., 100.])    # rest: norms 1 and 100
+        ratio = cache.apply(per_tensor_ratio=1.)
+        torch.testing.assert_close(a.grad, torch.tensor([.6, .8, 1.]))          # geometry of a scaled 5 -> 1
+        torch.testing.assert_close(b.grad, torch.tensor([10., 100.]))           # b: under the cap, unchanged
+        self.assertAlmostEqual(ratio, (1. + 100.) ** .5 / 125. ** .5)
+
+    def test_pilot_a_config_runs_without_unlearning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, rows, config = MainMethodConfigTest().run_tiny("cbg_pilot_a", Path(tmp), early_stop=[])
+            self.assertEqual((config["method"]["ul_weight"], config["method"]["geometry_cap_mode"]), (0.0, "per_tensor"))
+            self.assertEqual(result["status"], "complete")
+            trained = [r for r in rows if r["step"] > 0]
+            self.assertTrue(all("L_ul" not in r and r["geometry_applied"] == 1. for r in trained))
+
+
+class BalanceTest(unittest.TestCase):
+    def test_balance_scales_each_tensor_geometry_to_rho_times_its_rest(self):
+        from src.cbg.train_v2 import GeometryCache
+        a, b = torch.nn.Parameter(torch.zeros(2)), torch.nn.Parameter(torch.zeros(2))
+        model = torch.nn.Module()
+        model.a, model.b = a, b
+        a.grad, b.grad = torch.tensor([3., 4.]), torch.tensor([0., 1.])          # geometry norms 5 and 1
+        cache = GeometryCache(torch.float32)
+        cache.capture(model, norm=26. ** .5)
+        a.grad, b.grad = torch.tensor([1., 0.]), torch.tensor([20., 0.])         # rest norms 1 and 20
+        cache.apply(per_tensor_ratio=.5, balance=True)
+        torch.testing.assert_close(a.grad, torch.tensor([1.3, .4]))              # 5 -> 0.5 (scaled down)
+        torch.testing.assert_close(b.grad, torch.tensor([20., 10.]))             # 1 -> 10 (scaled up)
+
+    def test_pilot_b_config_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, rows, config = MainMethodConfigTest().run_tiny("cbg_pilot_b", Path(tmp), early_stop=[])
+            self.assertEqual(config["method"]["geometry_cap_mode"], "balance")
+            self.assertEqual(result["status"], "complete")
+            self.assertTrue(all(r["geometry_applied"] == 1. for r in rows if r["step"] > 0))
+
+
+class GeometryStageTest(unittest.TestCase):
+    def test_geometry_stage_measures_a_checkpoint_without_training(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            helper = MainMethodConfigTest()
+            _, rows, config = helper.run_tiny("cbg_pilot_b", root, early_stop=[])   # builds data/model/config
+            before = {k: v.clone() for k, v in __import__("safetensors.torch", fromlist=["load_file"])
+                      .load_file(str(root / "model" / "model.safetensors")).items()}
+            with patch("transformers.AutoTokenizer.from_pretrained", return_value=Tokenizer()):
+                summary = run(root / "config.yaml", root / "data", root / "geo", root / "model", stage="geometry")
+            saved = json.loads((root / "geo" / "geometry.json").read_text())
+            self.assertAlmostEqual(summary["geo/log_eta_k"], rows[0]["geo/log_eta_k"])   # same as step 0 of training
+            self.assertEqual(saved["geo/batches"], len(saved["batches"]))
+            after = __import__("safetensors.torch", fromlist=["load_file"]).load_file(str(root / "model" / "model.safetensors"))
+            self.assertTrue(all(torch.equal(before[k], after[k]) for k in before))
+
+
+class TrajectoryTrainTest(unittest.TestCase):
+    def test_alpha_zero_reproduces_the_plain_method_and_trajectory_logs_the_attack_point(self):
+        helper = MainMethodConfigTest()
+        with tempfile.TemporaryDirectory() as tmp:
+            _, plain, _ = helper.run_tiny("cbg_pilot_b", Path(tmp), early_stop=[])
+        with tempfile.TemporaryDirectory() as tmp:
+            # geometry_trajectory [0] is the plain method: identical training log.
+            from unittest.mock import patch
+            root = Path(tmp)
+            _, _, config = helper.run_tiny("cbg_pilot_c", root, early_stop=[])
+            config["method"]["geometry_trajectory"] = [0.0]
+            path = root / "c0.yaml"
+            path.write_text(yaml.safe_dump(config), encoding="utf-8")
+            with patch("transformers.AutoTokenizer.from_pretrained", return_value=Tokenizer()):
+                run(path, root / "data", root / "t0", root / "model", stage="train")
+            zero = [json.loads(l) for l in (root / "t0" / "train_log.jsonl").read_text().splitlines()]
+            for a_row, b_row in zip(plain, zero):
+                for key in ("L_aln", "L_bgn", "grad_norm_total"):
+                    if key in a_row:
+                        self.assertAlmostEqual(a_row[key], b_row[key], places=10, msg=(a_row["step"], key))
+            # A large alpha on the tiny model: theta' must lower the attacker's loss; training stays finite.
+            config["method"]["geometry_trajectory"] = [0.0, 1e-2]
+            path.write_text(yaml.safe_dump(config), encoding="utf-8")
+            with patch("transformers.AutoTokenizer.from_pretrained", return_value=Tokenizer()):
+                result = run(path, root / "data", root / "t1", root / "model", stage="train")
+            rows = [json.loads(l) for l in (root / "t1" / "train_log.jsonl").read_text().splitlines()]
+            self.assertEqual(result["status"], "complete")
+            cbg = [r for r in rows if r.get("cbg_step") and "L_harm" in r]
+            self.assertTrue(cbg)
+            self.assertTrue(all(r["L_harm_traj_0.01"] < r["L_harm"] for r in cbg))
+            self.assertTrue(all("log_eta_k_traj_0.01" in r for r in cbg))
+            self.assertTrue(all(math.isfinite(r["grad_norm_total"]) for r in rows if r["step"] > 0))
+
+
+class CalibrateStageTest(unittest.TestCase):
+    def test_calibration_reports_attacker_loss_grid_and_restores_nothing_on_disk(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, _, config = MainMethodConfigTest().run_tiny("cbg_pilot_b", root, early_stop=[])
+            # "attacked" checkpoint = the trained tiny model; the pinned base = the original tiny model.
+            with patch("transformers.AutoTokenizer.from_pretrained", return_value=Tokenizer()),                     patch("src.experiments.prepare_v2.model_path", return_value=str(root / "model")):
+                result = run(root / "config.yaml", root / "data", root / "cal", root / "train" / "final",
+                             stage="calibrate")
+            self.assertEqual(len(result["grid"]), 12)
+            self.assertGreater(result["mean_abs_displacement"], 0.)
+            small = [g for g in result["grid"] if g["alpha"] == 1e-6 and g["sign_steps"] == 1][0]
+            self.assertAlmostEqual(small["L_harm"], result["L_harm_base"], places=3)   # tiny step ~ no change
+            self.assertTrue((root / "cal" / "calibration.json").exists())
+
+
+class SnapshotTest(unittest.TestCase):
+    def test_models_are_kept_at_the_requested_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result, _, config = MainMethodConfigTest().run_tiny("cbg_select", root, early_stop=[], save_models_at=[2])
+            self.assertEqual(config["logging"]["save_models_at"], [2])
+            self.assertEqual(result["status"], "complete")
+            self.assertTrue((root / "train" / "model-step-2" / "config.json").exists())
+            self.assertTrue((root / "train" / "final" / "config.json").exists())
+            from safetensors.torch import load_file
+            a = load_file(str(root / "train" / "model-step-2" / "model.safetensors"))
+            b = load_file(str(root / "train" / "final" / "model.safetensors"))
+            self.assertTrue(any(not torch.equal(a[k], b[k]) for k in a))   # a real intermediate model
 
 
 class HvpCheckSummaryTest(unittest.TestCase):
@@ -278,7 +569,7 @@ class HvpDryRun(unittest.TestCase):
                 run(config_path, root / "data", root / "control", root / "model", stage="train")
                 rows = [json.loads(l) for l in (root / "control" / "train_log.jsonl").read_text().splitlines()]
                 self.assertTrue(all(r.get("geometry_applied") == 0. and "geometry_failed" not in r for r in rows))
-                self.assertTrue(all(r["L_bgn"] >= 0 for r in rows))
+                self.assertTrue(all(r["L_bgn"] >= -1e-6 for r in rows))   # KL is 0 at step 1 up to rounding
 
 
 if __name__ == "__main__":

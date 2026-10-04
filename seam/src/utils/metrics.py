@@ -212,5 +212,12 @@ def eval_utility(model, tokenizer, tasks: list = ["mmlu"], batch_size: int = 24)
 def eval_harmfulness(model, tokenizer, test_dataloader):
     # Evaluate harmfulness
     baseline_harmfulness_scores = evaluate_harmfulness(model, test_dataloader, tokenizer, "beavertails")
-    harmful_score = sum(baseline_harmfulness_scores[0]['scores']) / len(baseline_harmfulness_scores[0]['scores'])
+    scores_by_group = baseline_harmfulness_scores[0]
+    if "scores" in scores_by_group:
+        scores = scores_by_group["scores"]
+    else:
+        scores = [score for group in scores_by_group.values() for score in group["scores"]]
+    if not scores:
+        raise RuntimeError("No harmfulness scores were produced")
+    harmful_score = sum(scores) / len(scores)
     return harmful_score

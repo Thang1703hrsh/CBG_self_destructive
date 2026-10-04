@@ -33,7 +33,8 @@ def tiny_model_and_tokenizer(path):
     LlamaForCausalLM(config).save_pretrained(path)
 
 
-def simple_attack(model, dataset, *, learning_rate, output_dir, seed=42, bf16=True, use_cpu=False, batch_size=4):
+def simple_attack(model, dataset, *, learning_rate, output_dir, seed=42, bf16=True, use_cpu=False, batch_size=4,
+                  **memory_options):
     """Stand-in for transformers.Trainer when accelerate is not installed (CPU dev boxes)."""
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     steps = 0

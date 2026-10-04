@@ -53,16 +53,13 @@ def construct_beavertails_dataset(
     attack_size=1000,
     defence_size=1000,
     context_length=CONTEXT_LENGTH,
-    load_test_dataset=True,
+    train_path="data/beavertails_with_refusals_train.json",
+    test_size=100,
 ):
-    with open("data/beavertails_with_refusals_train.json", "r", encoding = "utf-8") as f:
+    with open(train_path, "r", encoding = "utf-8") as f:
         trainds = json.load(f)
     trainds = Dataset.from_list(trainds)
-    testds = (
-        load_dataset("PKU-Alignment/BeaverTails", split="30k_test")
-        if load_test_dataset
-        else None
-    )
+    testds = load_dataset("PKU-Alignment/BeaverTails", split="30k_test")
     # prepare tokenizer where we have the subsets
     def _train_dataset_tokenizer(element):
         contents = element['response']
@@ -233,24 +230,24 @@ def construct_beavertails_dataset(
     )
     tokenized_harmless.set_format("torch")
 
-    tokenized_test = None
-    if testds is not None:
-        tokenizer.padding_side = "left"
-        tokenized_test = testds.map(
-            _test_dataset_tokenizer, batched=True,
-            remove_columns=[
-                col for col in
-                testds.column_names
-                if col not in ["input_ids", "attention_mask", "categories", "labels"]
-            ],
-            batch_size = None
-        )
-        tokenized_test.set_format("torch")
-        tokenizer.padding_side = "right"
+    tokenizer.padding_side = "left"
+
+    tokenized_test = testds.map(
+        _test_dataset_tokenizer, batched=True,
+        remove_columns=[
+            col for col in
+            testds.column_names
+            if col not in ["input_ids", "attention_mask", "categories", "labels"]
+        ],
+        batch_size = None
+    )
+    tokenized_test.set_format("torch")
+
+    tokenizer.padding_side = "right"
 
     # only select 100 samples to test on
-    if tokenized_test is not None and len(tokenized_test) > 100:
-        tokenized_test = tokenized_test.select(range(100))
+    if test_size is not None and test_size > 0 and len(tokenized_test) > test_size:
+        tokenized_test = tokenized_test.select(range(test_size))
     if attack:
         if attack_size < len(tokenized_harmful):
             tokenized_harmful = tokenized_harmful.select(range(attack_size))
@@ -262,8 +259,10 @@ def construct_beavertails_dataset(
 
     return tokenized_harmful, tokenized_harmless, tokenized_test
 
-def construct_alpaca_dataset(tokenizer, retain_size = 1000):
+def construct_alpaca_dataset(tokenizer, retain_size = 1000, seed=None):
     ds = load_dataset("yahma/alpaca-cleaned")
+    if seed is not None:
+        ds["train"] = ds["train"].shuffle(seed=seed)
     def dataset_tokenizer(examples):
         prompts = [instruction + "\n" + input_text for instruction, input_text in 
                 zip(examples["instruction"], examples["input"])]

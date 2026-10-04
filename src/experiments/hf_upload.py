@@ -73,6 +73,17 @@ def _last_geometry(log_path):
             last["geo/log_eta_k"], "delta log eta_k": last["geo/log_eta_k"] - first["geo/log_eta_k"]}
 
 
+def _license(base_model):
+    """(card license id, license sentence) of the base model the weights derive from."""
+    name = base_model.lower()
+    if "llama-2" in name:
+        return "llama2", ("A derivative of Llama 2, distributed under the Llama 2 Community License Agreement; "
+                          "use is subject to its terms and Acceptable Use Policy.")
+    if "qwen2.5" in name or "mistral" in name:
+        return "apache-2.0", f"A derivative of `{base_model}`, distributed under the Apache License 2.0."
+    return "other", f"A derivative of `{base_model}`; see the base model's license."
+
+
 def model_card(run_dir, repo_id, *, dtype, base_model, base_revision=None):
     run_dir = Path(run_dir)
     config = yaml.safe_load((run_dir / "config.yaml").read_text(encoding="utf-8")) \
@@ -98,7 +109,8 @@ def model_card(run_dir, repo_id, *, dtype, base_model, base_revision=None):
     table = lambda values: "\n".join(["| | |", "|---|---|"] + [f"| {k} | {v} |" for k, v in values.items()
                                                                  if v is not None])
     geometry = _last_geometry(run_dir / "train_log.jsonl")
-    header = yaml.safe_dump(dict(base_model=base_model, license="llama2", library_name="transformers",
+    license_id, license_text = _license(base_model)
+    header = yaml.safe_dump(dict(base_model=base_model, license=license_id, library_name="transformers",
                                  pipeline_tag="text-generation", tags=["cbg", "safety", "tamper-resistance"]),
                             sort_keys=False)
     return "\n".join([
@@ -112,8 +124,7 @@ def model_card(run_dir, repo_id, *, dtype, base_model, base_revision=None):
         "## Provenance", "", table(provenance), "",
         "Training records (config, identity, per-step log, metrics) are in `training/`.", "",
         "## License", "",
-        "A derivative of Llama 2, distributed under the Llama 2 Community License Agreement; "
-        "use is subject to its terms and Acceptable Use Policy.", ""])
+        license_text, ""])
 
 
 # Result files of an ablation (scripts/run_ablation.sh) that go to the results repository: small text/JSON
@@ -128,10 +139,15 @@ def results_card(out_dir, repo_id):
     out_dir = Path(out_dir)
     read = lambda name: (out_dir / name).read_text(encoding="utf-8").strip() if (out_dir / name).exists() else None
     val, test = read("summary.md"), read("summary_test.md")
+    # The base model of the trained runs (all runs of one OUT_DIR share it).
+    models = sorted({yaml.safe_load(path.read_text(encoding="utf-8")).get("model")
+                     for path in out_dir.glob("runs/*/train/config.yaml")} - {None})
+    base_model = models[0] if len(models) == 1 else "meta-llama/Llama-2-7b-chat-hf"
     return "\n".join([
-        "---", yaml.safe_dump(dict(license="llama2", tags=["cbg", "safety", "ablation"]), sort_keys=False).strip(),
+        "---", yaml.safe_dump(dict(license=_license(base_model)[0], tags=["cbg", "safety", "ablation"]),
+                              sort_keys=False).strip(),
         "---", "", f"# {repo_id.split('/')[-1]}", "",
-        "CBG-HVP hyperparameter ablation on Llama-2-7B-Chat (`scripts/run_ablation.sh`).", "",
+        f"CBG v2 runs on `{base_model}` and their evaluation (`scripts/run_ablation.sh`).", "",
         "* `summary_test.*`: the ablation table. HS = greedy generation on the test prompts scored by the "
         "BeaverTails DeBERTa classifier; ZS = zero-shot mean acc of TruthfulQA-MC1, MMLU, HellaSwag, ARC-easy; "
         "both before and after a harmful fine-tuning attack at each learning rate (SEAM protocol).",
@@ -209,17 +225,22 @@ def main(argv=None):
 
 
 def upload_run(run_dir, repo_id, *, private=True, dtype="float32", base_model=None, base_revision=None,
-               api=None, token=None, staging_dir=None, commit_message=None):
-    """Upload <run_dir>/final plus training records and a model card; returns the upload record."""
+               api=None, token=None, staging_dir=None, commit_message=None, model_subdir="final",
+               require_complete=True):
+    """Upload <run_dir>/<model_subdir> plus training records and a model card; returns the upload record.
+
+    model_subdir: "final" or an intermediate snapshot such as "model-step-100" (logging.save_models_at).
+    require_complete=False also allows snapshots of a run stopped by an early-stop gate.
+    """
     from huggingface_hub import CommitOperationAdd, HfApi
     run_dir = Path(run_dir)
     check_repo_id(repo_id)
     if dtype not in DTYPES:
         raise ValueError(f"dtype must be one of {sorted(DTYPES)}")
-    metrics_path, final = run_dir / "metrics.json", run_dir / "final"
-    if not metrics_path.exists() or json.loads(metrics_path.read_text(encoding="utf-8")).get("status") != "complete" \
-            or not final.is_dir():
-        raise FileNotFoundError(f"{run_dir} has no completed training run (metrics.json + final/)")
+    metrics_path, final = run_dir / "metrics.json", run_dir / model_subdir
+    complete = metrics_path.exists() and json.loads(metrics_path.read_text(encoding="utf-8")).get("status") == "complete"
+    if (require_complete and not complete) or not final.is_dir():
+        raise FileNotFoundError(f"{run_dir} has no completed training run (metrics.json + {model_subdir}/)")
     if base_model is None:
         base_model = yaml.safe_load((run_dir / "config.yaml").read_text(encoding="utf-8"))["model"]
     api = api or HfApi(token=token)
@@ -236,11 +257,13 @@ def upload_run(run_dir, repo_id, *, private=True, dtype="float32", base_model=No
                                    base_revision=base_revision), encoding="utf-8")
         operations.append(CommitOperationAdd("README.md", str(card)))
         info = api.create_commit(repo_id=repo_id, repo_type="model", operations=operations,
-                                 commit_message=commit_message or f"CBG v2 run {run_dir.parent.name} ({dtype})")
+                                 commit_message=commit_message or
+                                 f"CBG v2 run {run_dir.parent.name}, {model_subdir} ({dtype})")
     record = dict(repo_id=repo_id, url=str(repo_url), private=private, dtype=dtype,
                   commit=getattr(info, "oid", None), commit_url=getattr(info, "commit_url", None),
                   files=[op.path_in_repo for op in operations])
-    write_json(run_dir / "hf_upload.json", record)
+    record["model_subdir"] = model_subdir
+    write_json(run_dir / ("hf_upload.json" if model_subdir == "final" else f"hf_upload_{model_subdir}.json"), record)
     return record
 
 

@@ -1,0 +1,71 @@
+# Fill SDD/CTRAP checkpoint and defense-data paths before evaluating all models.
+# You can first use -Models base,seam with the known SEAM run below.
+models:
+  base:
+    source:
+      kind: hf
+      repo_id: meta-llama/Llama-2-7b-chat-hf
+  seam:
+    source:
+      kind: hf
+      repo_id: ducthang1703/seam-llama2-7b-seed42-checkpoint500
+      revision: cceaabce27283438526db1396132a17b564ce44a
+    defense_data:
+      - kind: volume
+        volume: seam-full-data
+        path: seam-full-seed42-20260930T104315Z-a64e5914/defense.json
+  sdd:
+    source:
+      kind: hf
+      repo_id: ducthang1703/sdd-llama2-7b-seed42-step500
+    defense_data:
+      - kind: volume
+        volume: defense-compare-data
+        path: sdd-seed42-REPLACE_RUN_ID/sdd_pairs.jsonl
+  ctrap:
+    source:
+      kind: hf
+      repo_id: ducthang1703/ctrap-llama2-7b-seed42-10epoch
+    defense_data:
+      - kind: volume
+        volume: defense-compare-data
+        path: ctrap-l40s-seed42-20261001T034515Z-cd52d171/ctrap_defense.json
+
+data:
+  # A NEW common held-out attack pool, not the old run's 4000:5000 split.
+  # CPU preparation excludes every selected defense prompt and all test prompts.
+  attack:
+    kind: dataset
+    repo_id: PKU-Alignment/BeaverTails
+    split: 330k_train
+  test:
+    kind: dataset
+    repo_id: PKU-Alignment/BeaverTails
+    split: 30k_test
+  benign:
+    kind: dataset
+    repo_id: yahma/alpaca-cleaned
+    split: train
+    # Hold out the 4000 benign examples used by the seed-42 SEAM defense.
+    exclude_first: 4000
+    exclude_seed: 42
+
+protocol:
+  seed: 42
+  test_size: 0                # Use all eligible unique harmful test prompts after overlap exclusion.
+  attack_size: 1000
+  benign_size: 1000
+  steps: 250
+  train_batch_size: 4
+  utility_batch_size: 8
+  generation_batch_size: 4
+  context_length: 256
+  max_new_tokens: 50
+  # Preserve public SEAM full-sequence SFT, but correctly ignore padding.
+  # response_only is also supported; use the same setting for every model.
+  label_scope: full_sequence
+  harmful_label: LABEL_0
+  save_attacked_models: false
+
+
+

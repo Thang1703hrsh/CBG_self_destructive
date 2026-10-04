@@ -118,7 +118,8 @@ function Test-DataPrepared {
     } finally {
         $ErrorActionPreference = $previous
     }
-    return ($code -eq 0 -and $listing -match "manifest\.json")
+    # model_revision.json is written last: a prepare that failed at the model download is NOT prepared.
+    return ($code -eq 0 -and $listing -match "model_revision\.json")
 }
 
 # ---------------------------------------------------------------------------

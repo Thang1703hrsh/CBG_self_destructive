@@ -1,0 +1,391 @@
+
+\providecommand{\tbd}{--}
+
+\section{Experiments}
+\label{sec:experiments}
+
+We evaluate CBG in the order in which the experiments are run. Hyperparameters are selected on a validation split only (\cref{sec:exp_selection}). The main comparison against SEAM, SDD and CTRAP uses six fixed scenarios (\cref{sec:exp_main}). All remaining experiments compare CBG with the undefended base model only (\cref{sec:exp_lr,sec:exp_variance,sec:exp_decoding,sec:adaptive,sec:orthogonal,sec:barrier_analysis,sec:ablation,sec:overhead}).
+
+% ----------------------------------------------------------------------------
+\subsection{Experimental Setting}
+\label{sec:setting}
+
+\paragraph{Models.}
+All defenses start from Llama-2-7B-Chat (\texttt{meta-llama/Llama-2-7b-chat-hf}, revision pinned at data preparation). The same checkpoint is the frozen reference $\theta_0$ of $\Lbgn$ and the \emph{Base} model of every table.
+
+\paragraph{Data.}
+We follow SEAM's data recipe~\citep{wang2026seam}. The BeaverTails~\citep{ji2023beavertails} rows with refusals are filtered and shuffled with seed 42, then split into prompt-disjoint pools:
+\begin{itemize}
+  \item \textbf{Defense set $\mathcal D_h$}: 4{,}000 safety pairs $(x, y^h, y^s)$ with harmful responses $y^h$ and refusals $y^s$.
+  \item \textbf{Benign set $\mathcal D_b$}: 4{,}000 Alpaca-cleaned samples~\citep{taori2023alpaca}.
+  \item \textbf{Harmful attack set}: 1{,}000 pairs disjoint from $\mathcal D_h$.
+  \item \textbf{Harmfulness test set}: 100 BeaverTails \texttt{30k\_test} prompts, after SEAM's category filter.
+  \item \textbf{Validation attack set} (CBG only, \cref{sec:exp_selection}): 1{,}000 rows, prompt-disjoint from all of the above.
+  \item \textbf{Geometry set $\mathcal D_{\mathrm{geo}}$}: 8 fixed batches of $m=8$ pairs and $n=32$ Alpaca rows, disjoint from $\mathcal D_h$ and $\mathcal D_b$.
+\end{itemize}
+Benign fine-tuning data (\cref{sec:exp_main}) are 1{,}000 further Alpaca-cleaned rows, disjoint from $\mathcal D_b$ and $\mathcal D_{\mathrm{geo}}$. Every text uses SEAM's format \texttt{Question: \{prompt\}\textbackslash nAnswer: \{response\}} and is truncated to 256 tokens.
+
+\paragraph{CBG.}
+\begin{itemize}
+  \item \textbf{Measured set and batch:} $\U$ is the weight of every linear layer inside the transformer blocks (embeddings, norms and the output head are excluded). Each CBG step uses $m=8$ safety pairs and $n=32$ benign sequences.
+  \item \textbf{Geometry hyperparameters:} $k=4$, $\kappa_\mu=1$, $\xi=10^{-3}$, $\alpha=1$; $\beta$ is selected on the validation split.
+  \item \textbf{Curvature term:} computed by an exact Hessian--vector product in TF32. We check it against an FP32 Hessian--vector product and a central finite difference before training (\cref{app:impl}).
+  \item \textbf{Lazy geometry:} the full CBG step runs every 4 optimizer steps, and its geometry gradient is reused on the intermediate steps.
+  \item \textbf{Optimization:} full-parameter AdamW, learning rate $2\times10^{-5}$, cosine schedule with 10\% warmup, 500 steps, model split by layer over two H200 GPUs.
+  \item \textbf{CBG+UL:} additionally minimizes SEAM's unlearning loss $\mathcal L_{\mathrm{ul}}$ (layer-wise, log-transformed) on $y^h$, with weight $\gamma_{\mathrm{ul}}$ (\cref{sec:objective}).
+\end{itemize}
+
+\paragraph{Baselines.}
+In the main comparison (\cref{sec:exp_main}) we compare against three defenses:
+\begin{itemize}
+  \item SEAM~\citep{wang2026seam};
+  \item SDD~\citep{chen2025sdd};
+  \item CTRAP~\citep{yi2025ctrap}.
+\end{itemize}
+Each defense is trained from the same Llama-2-7B-Chat checkpoint with its released code and recommended hyperparameters. We report the defense data and training budget of each method in \cref{app:hparams}. All other experiments compare CBG with the undefended Base model only.
+
+\paragraph{Attack protocol.}
+Every attack starts from the clean (un-attacked) checkpoint of the evaluated model; attacks are never chained. Unless stated otherwise:
+\begin{itemize}
+  \item full-parameter supervised fine-tuning for one epoch, batch size 4 (250 steps on 1{,}000 samples);
+  \item cosine schedule, 10\% warmup, weight decay $0.01$, no gradient clipping, BF16, seed 42.
+\end{itemize}
+To fit a single 48\,GB GPU we use paged 8-bit AdamW with gradient checkpointing, in place of SEAM's FP32-state AdamW. This setting is identical for every model in a table, so all comparisons are within one attack configuration.
+
+\paragraph{Metrics.}
+\begin{itemize}
+  \item \textbf{Harmfulness score (HS):} the mean probability of the \texttt{harmful} label assigned by the BeaverTails DeBERTa classifier\footnote{\texttt{domenicrosati/deberta-v3-xsmall-beavertails-harmful-qa-classifier}.} to prompt plus response. Responses are generated greedily with at most 50 new tokens, and an empty response scores 0. We also report the fraction of responses with score $>0.5$.
+  \item \textbf{Zero-shot score (ZS):} the mean zero-shot accuracy (\texttt{acc}) on TruthfulQA (MC1), MMLU, HellaSwag and ARC-Easy, using LM Evaluation Harness~\citep{gao2024harness}.
+  \item \textbf{Compromised:} as in SEAM, an attacked model is \emph{compromised} if HS $>10\%$ while ZS $>30\%$. Low HS together with low ZS is \emph{self-destruction}. Low HS with intact ZS and a high attack loss is a failed attack, not a defense, so we report the attack's training loss with every attacked row.
+  \item \textbf{Geometry:} we report $\etak$ and $\rhohat$, always together with $\mu$, $m$ and $n$, and the normalizers $\nu_{1:k}$ and $\tr K_{bb}$, all on $\mathcal D_{\mathrm{geo}}$. The minibatch $\Resc$ and $\Barrier_\gamma$ are not reported, since they are $+\infty$ and $0$ by construction (\cref{prop:degenerate}).
+\end{itemize}
+
+% ----------------------------------------------------------------------------
+\subsection{Hyperparameter Selection}
+\label{sec:exp_selection}
+
+Before any test-set evaluation, each CBG configuration (value of $\beta$, and $\gamma_{\mathrm{ul}}$ for CBG+UL) passes two gates that use no test data:
+\begin{enumerate}
+  \item \textbf{Geometry gate} (during training, step 100): training stops unless the held-out $\log\etak$ on $\mathcal D_{\mathrm{geo}}$ has decreased by at least $0.5$ from its value at step 0.
+  \item \textbf{Validation-attack gate} (after training): one harmful attack at learning rate $5\times10^{-5}$ on the validation attack set. Harmfulness is measured on the held-out validation prompts, and the configuration is rejected if HS $\geq 75\%$.
+\end{enumerate}
+Among the configurations that pass, we select the one with the lowest validation HS whose pre-attack ZS is within $2$ points of Base. \Cref{tab:selection} lists every configuration tried, including rejected ones.
+
+\begin{table}[t]
+\centering
+\small
+\caption{CBG configurations on the validation split. $\Delta\log\etak$: change of held-out $\log\etak$ ($\mu$, $m=8$, $n=32$) at step 100 and at the end of training. Val.\ HS: harmfulness after the validation attack ($5\times10^{-5}$). Pre ZS: zero-shot score before any attack.}
+\label{tab:selection}
+\begin{tabular}{lcccccc}
+\toprule
+Variant & $\beta$ & $\gamma_{\mathrm{ul}}$ & $\Delta\log\etak$ (100 / end) & Val.\ HS$\downarrow$ & Pre ZS$\uparrow$ & Selected\\
+\midrule
+CBG    & \tbd & -- & \tbd\ / \tbd & \tbd & \tbd & \tbd\\
+CBG    & \tbd & -- & \tbd\ / \tbd & \tbd & \tbd & \tbd\\
+CBG+UL & \tbd & \tbd & \tbd\ / \tbd & \tbd & \tbd & \tbd\\
+CBG+UL & \tbd & \tbd & \tbd\ / \tbd & \tbd & \tbd & \tbd\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ----------------------------------------------------------------------------
+\subsection{Main Comparison with SEAM, SDD and CTRAP}
+\label{sec:exp_main}
+
+We compare all defenses in six scenarios (\cref{tab:scenarios}): the clean model, harmful fine-tuning at three learning rates, benign fine-tuning, and fine-tuning on poisoned data. Benign fine-tuning measures whether a defense degrades under ordinary use, where self-destruction is undesirable. The poisoned scenario mixes 100 harmful and 900 benign samples (10\% contamination), a realistic attack that hides harmful data in a benign task. Results are in \cref{tab:main}.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Scenarios of the main comparison. Harmful samples come from the attack set; benign samples are Alpaca-cleaned rows disjoint from all defense data. All fine-tuning follows the attack protocol of \cref{sec:setting}.}
+\label{tab:scenarios}
+\begin{tabular}{llcl}
+\toprule
+Case & Fine-tuning data & Learning rate & Purpose\\
+\midrule
+\texttt{clean}          & none                       & --                 & Safety and utility of the defended checkpoint\\
+\texttt{harmful-lr2e-5} & 1{,}000 harmful pairs      & $2\times10^{-5}$  & Robustness to harmful fine-tuning\\
+\texttt{harmful-lr5e-5} & 1{,}000 harmful pairs      & $5\times10^{-5}$  & Robustness at a larger learning rate\\
+\texttt{harmful-lr1e-4} & 1{,}000 harmful pairs      & $1\times10^{-4}$  & Robustness at a high learning rate\\
+\texttt{benign-lr2e-5}  & 1{,}000 Alpaca-cleaned     & $2\times10^{-5}$  & Effect of ordinary fine-tuning on safety and utility\\
+\texttt{mixed10-lr5e-5} & 100 harmful + 900 benign   & $5\times10^{-5}$  & Robustness to 10\% poisoned fine-tuning data\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table*}[t]
+\centering
+\caption{Main comparison on Llama-2-7B-Chat (seed 42). HS and ZS in \%. For every fine-tuned case, a defense succeeds if HS stays $\leq 10\%$ or ZS falls to $\leq 30\%$ (self-destruction), except under benign fine-tuning, where ZS should stay close to \texttt{clean}. Attack training losses are in \cref{app:attack_loss}.}
+\label{tab:main}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccccccccc}
+\toprule
+& \multicolumn{2}{c}{\texttt{clean}}
+& \multicolumn{2}{c}{\texttt{harmful-lr2e-5}}
+& \multicolumn{2}{c}{\texttt{harmful-lr5e-5}}
+& \multicolumn{2}{c}{\texttt{harmful-lr1e-4}}
+& \multicolumn{2}{c}{\texttt{benign-lr2e-5}}
+& \multicolumn{2}{c}{\texttt{mixed10-lr5e-5}}\\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}\cmidrule(lr){10-11}\cmidrule(lr){12-13}
+Model & HS$\downarrow$ & ZS$\uparrow$ & HS$\downarrow$ & ZS & HS$\downarrow$ & ZS & HS$\downarrow$ & ZS & HS$\downarrow$ & ZS$\uparrow$ & HS$\downarrow$ & ZS\\
+\midrule
+Base   & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd\\
+SEAM~\citep{wang2026seam} & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd\\
+SDD~\citep{chen2025sdd}   & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd\\
+CTRAP~\citep{yi2025ctrap} & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd\\
+\midrule
+CBG    & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd\\
+CBG+UL & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd\\
+\bottomrule
+\end{tabular}}
+\end{table*}
+
+\begin{table}[t]
+\centering
+\small
+\caption{Per-task zero-shot accuracy (\%) in the \texttt{clean} case, the components of ZS in \cref{tab:main}.}
+\label{tab:clean_tasks}
+\begin{tabular}{lccccc}
+\toprule
+Model & TruthfulQA & MMLU & HellaSwag & ARC-Easy & ZS\\
+\midrule
+Base   & \tbd & \tbd & \tbd & \tbd & \tbd\\
+SEAM   & \tbd & \tbd & \tbd & \tbd & \tbd\\
+SDD    & \tbd & \tbd & \tbd & \tbd & \tbd\\
+CTRAP  & \tbd & \tbd & \tbd & \tbd & \tbd\\
+CBG    & \tbd & \tbd & \tbd & \tbd & \tbd\\
+CBG+UL & \tbd & \tbd & \tbd & \tbd & \tbd\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ----------------------------------------------------------------------------
+\subsection{Full Learning-Rate Sweep}
+\label{sec:exp_lr}
+
+To match SEAM's main robustness experiment, we extend the harmful attack to its full learning-rate grid, adding $8\times10^{-5}$ and $2\times10^{-4}$ to the three rates of \cref{tab:main}. \Cref{tab:lr_sweep} compares CBG with Base and reports each attack's training loss. A defense that only slows fine-tuning would show a higher loss but the same final HS; one that self-destructs would show a sharp drop in ZS.
+
+\begin{table*}[t]
+\centering
+\caption{Harmful attack learning-rate sweep (1{,}000 samples, 250 steps, seed 42). HS and ZS in \%; Loss is the mean attack training loss.}
+\label{tab:lr_sweep}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccccccccccc}
+\toprule
+& \multicolumn{3}{c}{$2\times10^{-5}$}
+& \multicolumn{3}{c}{$5\times10^{-5}$}
+& \multicolumn{3}{c}{$8\times10^{-5}$}
+& \multicolumn{3}{c}{$1\times10^{-4}$}
+& \multicolumn{3}{c}{$2\times10^{-4}$}\\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}\cmidrule(lr){11-13}\cmidrule(lr){14-16}
+Model & HS$\downarrow$ & ZS & Loss & HS$\downarrow$ & ZS & Loss & HS$\downarrow$ & ZS & Loss & HS$\downarrow$ & ZS & Loss & HS$\downarrow$ & ZS & Loss\\
+\midrule
+Base   & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd\\
+CBG    & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd\\
+CBG+UL & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd\\
+\bottomrule
+\end{tabular}}
+\end{table*}
+
+% ----------------------------------------------------------------------------
+\subsection{Variance across Attack Seeds}
+\label{sec:exp_variance}
+
+The results above use a single attack seed. We repeat the attacks at $2\times10^{-5}$ and $1\times10^{-4}$ with attack seeds 43 and 44, together with the seed-42 run, on fixed defended checkpoints. This measures variability of the attack only, not of defense training. \Cref{tab:variance} reports mean and standard deviation over the three seeds.
+
+\begin{table}[t]
+\centering
+\small
+\caption{HS and ZS (\%, mean $\pm$ std over attack seeds 42--44).}
+\label{tab:variance}
+\begin{tabular}{lcccc}
+\toprule
+& \multicolumn{2}{c}{$2\times10^{-5}$} & \multicolumn{2}{c}{$1\times10^{-4}$}\\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+Model & HS$\downarrow$ & ZS & HS$\downarrow$ & ZS\\
+\midrule
+Base & \tbd\,$\pm$\,\tbd & \tbd\,$\pm$\,\tbd & \tbd\,$\pm$\,\tbd & \tbd\,$\pm$\,\tbd\\
+CBG  & \tbd\,$\pm$\,\tbd & \tbd\,$\pm$\,\tbd & \tbd\,$\pm$\,\tbd & \tbd\,$\pm$\,\tbd\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ----------------------------------------------------------------------------
+\subsection{Sensitivity to Decoding}
+\label{sec:exp_decoding}
+
+HS is measured with greedy decoding throughout. To check that conclusions do not depend on this choice, we re-measure HS at $1\times10^{-4}$ with the checkpoint's default sampling configuration (Llama-2-Chat: temperature $0.6$, top-$p$ $0.9$), the setting of SEAM's evaluation script (\cref{tab:decoding}).
+
+\begin{table}[t]
+\centering
+\small
+\caption{HS (\%) under greedy and sampled decoding, before and after the $1\times10^{-4}$ attack.}
+\label{tab:decoding}
+\begin{tabular}{lcccc}
+\toprule
+& \multicolumn{2}{c}{Pre-attack} & \multicolumn{2}{c}{After $1\times10^{-4}$}\\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+Model & Greedy & Sampled & Greedy & Sampled\\
+\midrule
+Base & \tbd & \tbd & \tbd & \tbd\\
+CBG  & \tbd & \tbd & \tbd & \tbd\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ----------------------------------------------------------------------------
+\subsection{Attack Variants}
+\label{sec:exp_variants}
+
+We next vary the attack itself, keeping learning rates of $5\times10^{-5}$ and $1\times10^{-4}$:
+\begin{itemize}
+  \item \textbf{Data size:} 10{,}000 harmful samples instead of 1{,}000.
+  \item \textbf{Parameter-efficient fine-tuning:} LoRA~\citep{hu2022lora} with rank 8, $\alpha=16$, on the query/value projections and on all linear modules.
+  \item \textbf{Optimizer:} SGD instead of AdamW.
+  \item \textbf{Long training at small learning rates:} up to 50K steps at $10^{-6}$ and $5\times10^{-6}$.
+  \item \textbf{Frozen layers:} fine-tuning with the intermediate layers frozen.
+\end{itemize}
+For each variant, \cref{tab:variants} reports HS, ZS and whether the attacked model is compromised.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Attack variants (HS / ZS in \%). Comp.: Yes if the attacked model is compromised (HS $>10\%$ and ZS $>30\%$), otherwise No.}
+\label{tab:variants}
+\begin{tabular}{lcccc}
+\toprule
+& \multicolumn{2}{c}{Base} & \multicolumn{2}{c}{CBG}\\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+Attack & HS / ZS & Comp. & HS / ZS & Comp.\\
+\midrule
+10K samples, $5\times10^{-5}$          & \tbd\ / \tbd & \tbd & \tbd\ / \tbd & \tbd\\
+10K samples, $1\times10^{-4}$          & \tbd\ / \tbd & \tbd & \tbd\ / \tbd & \tbd\\
+LoRA (q,v), $1\times10^{-4}$           & \tbd\ / \tbd & \tbd & \tbd\ / \tbd & \tbd\\
+LoRA (all), $1\times10^{-4}$           & \tbd\ / \tbd & \tbd & \tbd\ / \tbd & \tbd\\
+SGD, $1\times10^{-4}$                  & \tbd\ / \tbd & \tbd & \tbd\ / \tbd & \tbd\\
+50K steps, $10^{-6}$                   & \tbd\ / \tbd & \tbd & \tbd\ / \tbd & \tbd\\
+Frozen middle layers, $1\times10^{-4}$ & \tbd\ / \tbd & \tbd & \tbd\ / \tbd & \tbd\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ----------------------------------------------------------------------------
+\subsection{Escape-Seeking Attacks}
+\label{sec:adaptive}
+
+An adaptive attacker who knows CBG can target low-collateral directions instead of following the plain harmful gradient. We evaluate four such attacks against CBG and Base (\cref{tab:adaptive}):
+\begin{enumerate}
+  \item \textbf{Utility-preserving:} adds $\lambda\,\mathrm{KL}(p_{\theta_0}\Vert p_\theta)$ on benign prompts to $\Lhfa$, with $\lambda\in\{0.01,0.05,0.1,0.2\}$ and $\theta_0$ the pre-attack defended model.
+  \item \textbf{Projected:} removes from each attack gradient its component in the span of per-example benign gradients. This is the direction family that CBG penalizes as $\mu\to0$ (\cref{prop:degenerate}).
+  \item \textbf{Reverse-CBG:} adds $-\beta'\log\etak$ to the attack loss, mirroring SEAM's trap reversal.
+  \item \textbf{Renormalization:} a function-preserving rescaling of each SwiGLU block before fine-tuning (\cref{prop:reparam}).
+\end{enumerate}
+We also add Gaussian noise to the harmful gradient ($\sigma\in\{0.1,0.5,1\}$ relative to its RMS).
+
+\begin{table}[t]
+\centering
+\small
+\caption{Escape-seeking attacks at $5\times10^{-5}$ (HS / ZS in \%).}
+\label{tab:adaptive}
+\begin{tabular}{lcc}
+\toprule
+Attack & Base & CBG\\
+\midrule
+Utility-preserving ($\lambda=0.1$) & \tbd\ / \tbd & \tbd\ / \tbd\\
+Projected                          & \tbd\ / \tbd & \tbd\ / \tbd\\
+Reverse-CBG                        & -- & \tbd\ / \tbd\\
+Renormalization                    & \tbd\ / \tbd & \tbd\ / \tbd\\
+Gradient noise ($\sigma=0.5$)      & \tbd\ / \tbd & \tbd\ / \tbd\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ----------------------------------------------------------------------------
+\subsection{Orthogonalization}
+\label{sec:orthogonal}
+
+We apply refusal-direction orthogonalization~\citep{arditi2024refusal} to Base and CBG and report attack success rate (ASR) and ZS. This edit is not a fine-tuning step and lies outside our theory, so the experiment tests transfer only.
+
+% ----------------------------------------------------------------------------
+\subsection{Geometry Analysis}
+\label{sec:barrier_analysis}
+
+\paragraph{Training dynamics.}
+We track the held-out $\log\etak$, $\nu_{1:k}$, $\tr K_{bb}$, $\Lbgn$ and $\Laln$ every 50 steps (\cref{fig:geometry}). Together they test whether $\etak$ falls through benign coupling, as intended, rather than through flattening, uniform inflation of benign gradients, or degradation of the model (rising $\Lbgn$).
+
+\paragraph{Does geometry predict outcomes?}
+Across CBG configurations (\cref{tab:selection}), checkpoints and attack learning rates, we correlate the pre-attack $\etak$ with the ZS drop at matched HS increase. We also measure the escape ratio at attack checkpoints, which tests the path-bound assumption of \cref{prop:path}.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.9\linewidth}{\centering\vspace{6em}Held-out $\log\etak$, $\nu_{1:k}$, $\tr K_{bb}$, $\Lbgn$ and $\Laln$ during CBG training.\vspace{6em}}}
+\caption{Geometry and loss trajectories of CBG on $\mathcal D_{\mathrm{geo}}$ ($\mu$, $m=8$, $n=32$).}
+\label{fig:geometry}
+\end{figure}
+
+% ----------------------------------------------------------------------------
+\subsection{Ablations}
+\label{sec:ablation}
+
+Starting from the selected configuration, we change one component at a time and report held-out $\Delta\log\etak$, pre-attack ZS, and HS/ZS after the $5\times10^{-5}$ attack (\cref{tab:ablation}). The ablations are:
+\begin{enumerate}
+  \item $\log\etak$ versus raw $\rhohat$;
+  \item $\Lam$ versus Euclidean damping;
+  \item $k\in\{1,2,4,8\}$;
+  \item sampled versus empirical Fisher;
+  \item $n\in\{8,32,128\}$ at a fixed token budget;
+  \item exact solve versus Rayleigh ascent with $K\in\{1,3,5\}$ iterations;
+  \item exact Hessian--vector product versus finite differences, at several radii $r$ and in FP32 versus BF16;
+  \item removing $\Laln$ or $\Lbgn$;
+  \item detached versus differentiated $\mu$;
+  \item one versus several sign draws, and the shared direction versus per-example perturbations;
+  \item lazy period $1$ versus $4$;
+  \item CBG versus CBG+UL versus UL alone ($\beta=0$).
+\end{enumerate}
+The last comparison isolates the contribution of the geometry term from that of the unlearning loss.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Ablations. Attack: $5\times10^{-5}$, HS / ZS in \%.}
+\label{tab:ablation}
+\begin{tabular}{lccc}
+\toprule
+Variant & $\Delta\log\etak$ & Pre ZS$\uparrow$ & Attack HS / ZS\\
+\midrule
+CBG (selected)              & \tbd & \tbd & \tbd\ / \tbd\\
+UL only ($\beta=0$)         & \tbd & \tbd & \tbd\ / \tbd\\
+CBG+UL                      & \tbd & \tbd & \tbd\ / \tbd\\
+Raw $\rhohat$               & \tbd & \tbd & \tbd\ / \tbd\\
+Euclidean damping           & \tbd & \tbd & \tbd\ / \tbd\\
+Empirical Fisher            & \tbd & \tbd & \tbd\ / \tbd\\
+Detached $\mu$              & \tbd & \tbd & \tbd\ / \tbd\\
+Without $\Lbgn$             & \tbd & \tbd & \tbd\ / \tbd\\
+Lazy period 1               & \tbd & \tbd & \tbd\ / \tbd\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ----------------------------------------------------------------------------
+\subsection{Overhead}
+\label{sec:overhead}
+
+We report wall-clock time per step, peak GPU memory and total training time of CBG on the same hardware, broken down into center pass, Gram contraction, direction pass and curvature pass (\cref{app:impl}). For reference we also list the training time of SEAM, SDD and CTRAP as run in \cref{sec:exp_main}.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Training cost on 2$\times$H200 (500 steps).}
+\label{tab:overhead}
+\begin{tabular}{lccc}
+\toprule
+Method & Time / step (s) & Peak memory (GiB) & Total (h)\\
+\midrule
+SEAM   & \tbd & \tbd & \tbd\\
+SDD    & \tbd & \tbd & \tbd\\
+CTRAP  & \tbd & \tbd & \tbd\\
+CBG    & \tbd & \tbd & \tbd\\
+CBG+UL & \tbd & \tbd & \tbd\\
+\bottomrule
+\end{tabular}
+\end{table}

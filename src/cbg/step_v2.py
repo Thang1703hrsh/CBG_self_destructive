@@ -411,6 +411,124 @@ def plain_gradient(model, joint, config, *, reference=None, samples=None, sample
     return stats
 
 
+def _final_norm(model, block_path):
+    inner = model.get_submodule(block_path.rsplit(".", 1)[0]) if "." in block_path else model
+    return inner.norm
+
+
+def _harmful_layer_ce_sum(model, batch, norm, head):
+    """Sum over the harmful response tokens of CE(final logits) + sum_l CE(head(norm(h_l))) (SEAM logit lens).
+
+    ``batch`` is a safety micro-batch: rows [0, m) are the harmful sequences. Returns (sum, hidden-state count).
+    The final norm is per token, so norm + head are applied to the response positions only: the per-layer
+    logits are [response tokens, vocabulary] (~50 MB on 7B), small enough to keep for the backward without
+    activation checkpointing (whose recomputation does not reproduce autocast casts).
+    """
+    rows = batch.m
+    ids, attention, response = batch.input_ids[:rows], batch.attention_mask[:rows], batch.response_mask[:rows]
+    output = model(input_ids=ids, attention_mask=attention, output_hidden_states=True)
+    device = head.weight.device
+    mask = (response[:, 1:].bool() & attention[:, 1:].bool()).to(device)
+    targets = ids[:, 1:].to(device)[mask]
+
+    def ce_sum(logits):
+        if logits.dtype in (torch.float16, torch.bfloat16):   # fp32 softmax under autocast; fp64 stays fp64
+            logits = logits.float()
+        return torch.nn.functional.cross_entropy(logits, targets, reduction="sum")
+
+    total = ce_sum(output.logits.to(device)[:, :-1][mask])
+    for hidden in output.hidden_states:
+        active = hidden.to(device)[:, :-1][mask]
+        total = total + ce_sum(head(norm(active).to(head.weight.dtype)))
+    return total, len(output.hidden_states)
+
+
+def unlearning_gradient(model, joint, config, *, weight, chunks=None, scale=1.):
+    """Accumulate weight * L_ul into .grad, with SEAM's unlearning loss (seam/src/core/trainer.py):
+
+        L_ul = -log( (CE_final + sum_l CE_l) / n_hidden + 1 ),   CE = token mean over the harmful responses,
+
+    computed exactly over the whole batch despite micro-batching: a no-grad pass gives the batch value L,
+    then each micro-batch backpropagates its share with the weight -weight / L (d(-log L) = -dL / L).
+    """
+    chunks = chunks or make_chunks(joint, config.microbatch_tokens)
+    safety = [chunk for chunk in chunks if chunk.batch.m]
+    tokens = int(_response_mask(joint)[:joint.m].sum())
+    if not safety or not tokens:
+        raise ValueError("SEAM unlearning loss needs harmful responses in the batch")
+    norm, head = _final_norm(model, config.block_path), model.get_output_embeddings()
+    device_type = joint.input_ids.device.type
+    with spec_precision(model, config.perturb_precision), _deterministic(config.deterministic):
+        total, layers = 0., None
+        with torch.no_grad():
+            for chunk in safety:
+                with _autocast(device_type, config.perturb_precision):
+                    value, layers = _harmful_layer_ce_sum(model, chunk.batch, norm, head)
+                total += float(value)
+        mean = total / tokens / layers + 1.
+        for chunk in safety:
+            with _autocast(device_type, config.perturb_precision):
+                value, _ = _harmful_layer_ce_sum(model, chunk.batch, norm, head)
+            (value * (-weight * scale / (mean * tokens * layers))).backward()
+            del value
+    return dict(L_ul=-math.log(mean), ul_harmful_ce_mean=mean - 1.)
+
+
+def harmful_sft_loss(model, joint, config, *, chunks=None, backward=False):
+    """The attacker's loss: mean CE on the harmful responses y^h of the batch (token mean over the batch).
+
+    With ``backward`` its gradient is accumulated into .grad of every trainable parameter. Returns the value.
+    """
+    chunks = chunks or make_chunks(joint, config.microbatch_tokens)
+    safety = [chunk for chunk in chunks if chunk.batch.m]
+    tokens = int(_response_mask(joint)[:joint.m].sum())
+    if not safety or not tokens:
+        raise ValueError("the attacker's loss needs harmful responses in the batch")
+    device_type = joint.input_ids.device.type
+    total = 0.
+    context = nullcontext() if backward else torch.no_grad()
+    with spec_precision(model, config.perturb_precision), _deterministic(config.deterministic), context:
+        for chunk in safety:
+            rows = chunk.batch.m
+            ids, attention = chunk.batch.input_ids[:rows], chunk.batch.attention_mask[:rows]
+            with _autocast(device_type, config.perturb_precision):
+                logits = _logits(model, JointBatch(ids, attention, chunk.batch.response_mask[:rows],
+                                                   chunk.seq_examples[:rows], m=0, n=rows))
+            mask = (chunk.batch.response_mask[:rows, 1:].bool() & attention[:, 1:].bool()).to(logits.device)
+            active = logits[:, :-1][mask]
+            if active.dtype in (torch.float16, torch.bfloat16):
+                active = active.float()
+            value = torch.nn.functional.cross_entropy(active, ids[:, 1:].to(logits.device)[mask], reduction="sum")
+            if backward:
+                (value / tokens).backward()
+            total += float(value)
+            del logits, active, value
+    return total / tokens
+
+
+def attack_sign_direction(model, joint, config, *, chunks=None):
+    """sign(grad of the attacker's loss) for every trainable parameter, as int8 (an Adam-like first step).
+
+    Uses and then clears .grad. Returns (signs, attacker loss at theta).
+    """
+    params = [p for p in model.parameters() if p.requires_grad]
+    for p in params:
+        p.grad = None
+    loss = harmful_sft_loss(model, joint, config, chunks=chunks, backward=True)
+    signs = [(p, torch.zeros_like(p, dtype=torch.int8) if p.grad is None else torch.sign(p.grad).to(torch.int8))
+             for p in params]
+    for p in params:
+        p.grad = None
+    return signs, loss
+
+
+@torch.no_grad()
+def shift_weights(signs, alpha):
+    """theta <- theta + alpha * signs (in place, fp32 master weights). Undo with -alpha (exact up to rounding)."""
+    for p, sign in signs:
+        p.add_(sign.to(p.dtype), alpha=alpha)
+
+
 def cbg_step(model, batch, config: StepConfig, *, reference=None, sample_generator=None,
              sign_generator=None, fixed_samples=None, signs=None, include_base=True):
     """Accumulate the CBG v2 gradient (spec section 8) into the parameters' .grad.

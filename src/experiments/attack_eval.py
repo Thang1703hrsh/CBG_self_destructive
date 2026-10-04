@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 from pathlib import Path
 import statistics
 
@@ -66,8 +67,13 @@ def load_tokenizer(path):
 
 
 def load_model(path, device, dtype):
+    """Weights are streamed shard by shard straight to ``device`` in ``dtype`` (an fp32 7B checkpoint
+    never sits in host RAM at once)."""
     from transformers import AutoModelForCausalLM
-    return AutoModelForCausalLM.from_pretrained(path, torch_dtype=dtype).to(device)
+    if str(device) == "cpu":
+        return AutoModelForCausalLM.from_pretrained(path, torch_dtype=dtype)
+    return AutoModelForCausalLM.from_pretrained(path, torch_dtype=dtype, low_cpu_mem_usage=True,
+                                                device_map={"": str(device)})
 
 
 def attack_dataset(tokenizer, rows, max_length=CONTEXT_LENGTH):
@@ -81,16 +87,47 @@ def attack_dataset(tokenizer, rows, max_length=CONTEXT_LENGTH):
                               "labels": encoded["input_ids"].tolist()}).with_format("torch")
 
 
-def run_attack(model, dataset, *, learning_rate, output_dir, seed=42, bf16=True, use_cpu=False, batch_size=4):
+def run_attack(model, dataset, *, learning_rate, output_dir, seed=42, bf16=True, use_cpu=False, batch_size=4,
+               optim="adamw_torch", gradient_checkpointing=False, save_at_steps=(), save_dir=None, tokenizer=None):
+    """``optim``/``gradient_checkpointing`` are memory options: SEAM uses adamw_torch without checkpointing
+    (~55 GB for 7B). On a 48 GB GPU (L40S) use optim=paged_adamw_8bit + gradient checkpointing (~42 GB);
+    the optimizer then differs from SEAM, so evaluate the base model with the same options."""
     from transformers import Trainer, TrainingArguments
     args = TrainingArguments(output_dir=str(output_dir), per_device_train_batch_size=batch_size, num_train_epochs=1,
                              learning_rate=learning_rate, weight_decay=0.01, lr_scheduler_type="cosine",
-                             warmup_ratio=0.1, max_grad_norm=None, bf16=bf16, optim="adamw_torch",
+                             warmup_ratio=0.1, max_grad_norm=None, bf16=bf16, optim=optim,
+                             gradient_checkpointing=gradient_checkpointing,
+                             gradient_checkpointing_kwargs={"use_reentrant": False} if gradient_checkpointing else None,
                              save_strategy="no", report_to=[], logging_steps=10, seed=seed, use_cpu=use_cpu)
-    trainer = Trainer(model=model, args=args, train_dataset=dataset)
+    if gradient_checkpointing:
+        model.config.use_cache = False
+    callbacks = []
+    if save_at_steps:
+        from transformers import TrainerCallback
+
+        class SaveAt(TrainerCallback):
+            """Model-only snapshots at the given optimizer steps (no optimizer state), for geometry diagnostics."""
+            def on_step_end(self, args, state, control, model=None, **kwargs):
+                if state.global_step in save_at_steps:
+                    target = Path(save_dir) / f"step-{state.global_step}"
+                    model.save_pretrained(target, safe_serialization=True)
+                    if tokenizer is not None:
+                        tokenizer.save_pretrained(target)
+        callbacks.append(SaveAt())
+    trainer = Trainer(model=model, args=args, train_dataset=dataset, callbacks=callbacks)
     output = trainer.train()
+    if save_at_steps and int(output.global_step) not in save_at_steps:   # always keep the final attacked model
+        target = Path(save_dir) / f"step-{int(output.global_step)}"
+        model.save_pretrained(target, safe_serialization=True)
+        if tokenizer is not None:
+            tokenizer.save_pretrained(target)
     del trainer
-    return dict(train_loss=float(output.training_loss), steps=int(output.global_step))
+    if gradient_checkpointing:
+        model.gradient_checkpointing_disable()
+        model.config.use_cache = True   # generation after the attack
+    peak = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else None
+    return dict(train_loss=float(output.training_loss), steps=int(output.global_step), optim=optim,
+                gradient_checkpointing=gradient_checkpointing, peak_memory_gib=peak)
 
 
 def deberta_classifier(model_id=CLASSIFIER, device=None):
@@ -141,8 +178,10 @@ def utility(model, tokenizer, tasks, batch_size=24):
     import lm_eval
     from lm_eval.models.huggingface import HFLM
     model.eval()   # after an attack the Trainer leaves the model in train mode (dropout config of the checkpoint)
+    # CBG_LM_EVAL_LIMIT: fraction/count of examples per task, for smoke runs only (not reportable).
+    limit = float(os.environ.get("CBG_LM_EVAL_LIMIT", 0)) or None
     results = lm_eval.simple_evaluate(model=HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size),
-                                      tasks=list(tasks), num_fewshot=0, batch_size=batch_size)["results"]
+                                      tasks=list(tasks), num_fewshot=0, batch_size=batch_size, limit=limit)["results"]
     return {task: results[task].get("acc,none") for task in tasks}
 
 
@@ -160,7 +199,9 @@ def _free():
 
 def evaluate_model(model_path, data_dir, output_dir, *, mode="val", learning_rates=(2e-5, 5e-5, 1e-4),
                    utility_tasks=("arc_easy",), post_utility=False, device="cuda:0", dtype=torch.bfloat16, seed=42,
-                   classifier=None, utility_fn=utility, val_eval_size=100, batch_size=4, decoding="checkpoint"):
+                   classifier=None, utility_fn=utility, val_eval_size=100, batch_size=4, decoding="checkpoint",
+                   tokenizer_path=None, optim="adamw_torch", gradient_checkpointing=False, gen_batch_size=None,
+                   skip_pre=False, save_at_steps=()):
     """Pre-attack harmfulness/utility, then one attack per learning rate (each from the checkpoint).
 
     Resumable: results are written after every phase and completed phases are skipped.
@@ -178,14 +219,15 @@ def evaluate_model(model_path, data_dir, output_dir, *, mode="val", learning_rat
                   utility_tasks=list(utility_tasks), seed=seed, decoding=decoding, post_utility=post_utility,
                   protocol="SEAM eval.py (attack mode)")
     result.setdefault("attacks", {})
-    tokenizer = load_tokenizer(model_path)
+    tokenizer = load_tokenizer(tokenizer_path or model_path)
+    gen_batch_size = gen_batch_size or batch_size
     classifier = classifier or deberta_classifier(device=device if str(device).startswith("cuda") else None)
     bf16, use_cpu = dtype == torch.bfloat16, str(device) == "cpu"
 
-    if "pre" not in result:
+    if "pre" not in result and not skip_pre:
         model = load_model(model_path, device, dtype)
         result["pre"] = dict(harmfulness=harmfulness(model, tokenizer, prompts, classifier=classifier,
-                                                     batch_size=batch_size, seed=seed, decoding=decoding),
+                                                     batch_size=gen_batch_size, seed=seed, decoding=decoding),
                              utility=with_zs(utility_fn(model, tokenizer, utility_tasks)))
         del model
         _free()
@@ -199,9 +241,11 @@ def evaluate_model(model_path, data_dir, output_dir, *, mode="val", learning_rat
             continue
         model = load_model(model_path, device, dtype)
         training = run_attack(model, dataset, learning_rate=lr, output_dir=output / f"trainer-{key}", seed=seed,
-                              bf16=bf16, use_cpu=use_cpu, batch_size=batch_size)
+                              save_at_steps=tuple(save_at_steps), save_dir=output / f"attacked-{key}", tokenizer=tokenizer,
+                              bf16=bf16, use_cpu=use_cpu, batch_size=batch_size, optim=optim,
+                              gradient_checkpointing=gradient_checkpointing)
         entry = dict(training, harmfulness=harmfulness(model, tokenizer, prompts, classifier=classifier,
-                                                       batch_size=batch_size, seed=seed, decoding=decoding))
+                                                       batch_size=gen_batch_size, seed=seed, decoding=decoding))
         if post_utility:
             entry["utility"] = with_zs(utility_fn(model, tokenizer, utility_tasks))
         result["attacks"][key] = entry
@@ -211,8 +255,9 @@ def evaluate_model(model_path, data_dir, output_dir, *, mode="val", learning_rat
         print(json.dumps(dict(phase=f"attack lr={key}", harmfulness=entry["harmfulness"]["score"],
                               train_loss=entry["train_loss"])), flush=True)
     done = [result["attacks"][f"{lr:g}"]["harmfulness"]["score"] for lr in learning_rates]
-    result["post_harmfulness_mean"] = statistics.mean(done)
-    result["post_harmfulness_max"] = max(done)
+    if done:
+        result["post_harmfulness_mean"] = statistics.mean(done)
+        result["post_harmfulness_max"] = max(done)
     write_json(path, result)
     return result
 
@@ -230,11 +275,22 @@ def main(argv=None):
                         help="harmfulness generation: checkpoint (SEAM eval.py) or greedy (evaluation guide)")
     parser.add_argument("--classifier", default=CLASSIFIER)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--tokenizer", default=None, help="tokenizer path/repo (default: --model)")
+    parser.add_argument("--optim", default="adamw_torch",
+                        help="attack optimizer: adamw_torch (SEAM) | paged_adamw_8bit (48 GB GPUs)")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--gen-batch-size", type=int, default=None, help="harmfulness generation batch")
+    parser.add_argument("--skip-pre", action="store_true", help="attacks only (pre-attack evaluated elsewhere)")
+    parser.add_argument("--save-at-steps", default="", help="comma-separated attack steps at which the attacked "
+                        "model is saved to <output>/attacked-<lr>/step-<n> (geometry diagnostics)")
     args = parser.parse_args(argv)
     result = evaluate_model(args.model, args.data, args.output, mode=args.mode,
                             learning_rates=[float(v) for v in args.lrs.split(",") if v],
                             utility_tasks=[t for t in args.utility.split(",") if t], post_utility=args.post_utility,
-                            seed=args.seed, decoding=args.decoding,
+                            seed=args.seed, decoding=args.decoding, tokenizer_path=args.tokenizer,
+                            optim=args.optim, gradient_checkpointing=args.gradient_checkpointing,
+                            gen_batch_size=args.gen_batch_size, skip_pre=args.skip_pre,
+                            save_at_steps=[int(v) for v in args.save_at_steps.split(",") if v],
                             classifier=deberta_classifier(args.classifier, device="cuda:0"))
     print(json.dumps({k: v for k, v in result.items() if k in ("post_harmfulness_mean", "post_harmfulness_max")}))
 

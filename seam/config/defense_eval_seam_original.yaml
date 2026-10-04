@@ -1,0 +1,74 @@
+# Base, SEAM, SDD and CTRAP under SEAM's own evaluator protocol (src/eval.py +
+# src/data_processing/_datasets.py), on Modal profile oanhtranbachkhoa, one L40S per case.
+#  - HS: first 100 BeaverTails 30k_test prompts after SEAM's category filter (file order).
+#  - Attack: the shared RepNoise attack split (rows 4000-4999 after seed-42 shuffle), file order.
+#  - Attack labels: text padded to 256 tokens, labels = input_ids incl. eos padding.
+#  - HS generation: sampled with T=0.6, top_p=0.9 (seeded), 50 new tokens.
+# Deviation kept for L40S (48 GB): paged_adamw_8bit instead of adamw_torch; batch 1 x grad-accum 4.
+models:
+  base:
+    source:
+      kind: hf
+      repo_id: meta-llama/Llama-2-7b-chat-hf
+  seam:
+    source:
+      kind: hf
+      repo_id: ducthang1703/seam-llama2-7b-seed42-checkpoint500
+      revision: cceaabce27283438526db1396132a17b564ce44a
+    defense_data:
+      - kind: volume
+        volume: seam-full-data
+        path: seam-full-seed42-20260930T104315Z-a64e5914/defense.json
+  sdd:
+    source:
+      kind: volume
+      volume: defense-compare-results
+      path: sdd-seed42-20261003T135304Z-977553aa/defense/model
+    defense_data:
+      - kind: volume
+        volume: defense-compare-data
+        path: sdd-seed42-20261003T135304Z-977553aa/sdd_pairs.jsonl
+  ctrap:
+    source:
+      kind: hf
+      repo_id: ducthang1703/ctrap-llama2-7b-seed42-step500
+      revision: a5afa109a04ab5dee6e304b6dbfcc94e233b2499
+    defense_data:
+      - kind: volume
+        volume: defense-compare-data
+        path: ctrap-l40s-seed42-20261001T030609Z-306acd8b/ctrap_defense.json
+
+data:
+  attack:
+    # prepare_split output (RepNoise, seed 42, rows 4000:5000), same for every defense run.
+    kind: volume
+    volume: defense-compare-data
+    path: sdd-seed42-20261003T135304Z-977553aa/attack.json
+  test:
+    kind: dataset
+    repo_id: PKU-Alignment/BeaverTails
+    split: 30k_test
+  benign:
+    kind: dataset
+    repo_id: yahma/alpaca-cleaned
+    split: train
+    exclude_first: 4000
+    exclude_seed: 42
+
+protocol:
+  seed: 42
+  test_size: 100
+  attack_size: 1000
+  benign_size: 1000
+  steps: 250
+  train_batch_size: 4
+  utility_batch_size: 24
+  generation_batch_size: 16
+  context_length: 256
+  max_new_tokens: 50
+  label_scope: seam_padded
+  data_selection: seam_original
+  # SEAM's evaluator samples (Llama-2-chat defaults T=0.6, top_p=0.9); seeded here.
+  decoding: sample
+  harmful_label: LABEL_0
+  save_attacked_models: false

@@ -56,6 +56,23 @@ class HfUploadTest(unittest.TestCase):
             self.assertEqual(files["model.safetensors"], (run / "final" / "model.safetensors").read_bytes())
             self.assertEqual(json.loads((run / "hf_upload.json").read_text())["commit"], record["commit"])
 
+    def test_intermediate_snapshot_upload_in_bfloat16(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.make_run(Path(tmp))
+            tiny_model(run / "model-step-100")
+            (run / "metrics.json").write_text(json.dumps(dict(status="early_stopped", step=250)))
+            with self.assertRaises(FileNotFoundError):   # the default still requires a completed run
+                upload_run(run, "user/cbg-7b-step100", api=FakeApi(), model_subdir="model-step-100")
+            api = FakeApi()
+            record = upload_run(run, "user/cbg-7b-step100", api=api, dtype="bfloat16", model_subdir="model-step-100",
+                                require_complete=False, staging_dir=str(Path(tmp)))
+            self.assertEqual(record["model_subdir"], "model-step-100")
+            self.assertTrue((run / "hf_upload_model-step-100.json").exists())
+            self.assertFalse((run / "hf_upload.json").exists())
+            weights = api.commits[0]["model.safetensors"]
+            import safetensors.torch as st
+            self.assertTrue(all(t.dtype == torch.bfloat16 for t in st.load(weights).values() if t.is_floating_point()))
+
     def test_bfloat16_cast_and_input_checks(self):
         with tempfile.TemporaryDirectory() as tmp:
             run = self.make_run(Path(tmp))

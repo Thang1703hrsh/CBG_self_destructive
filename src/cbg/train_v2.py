@@ -24,7 +24,8 @@ import yaml
 
 from src.cbg.spec import joint_batch
 from src.cbg.step_v2 import (StepConfig, cbg_step, curvature_estimates, curvature_gradient, make_chunks,
-                             measure_geometry, place_layers, plain_gradient, reference_logits)
+                             measure_geometry, place_layers, plain_gradient, reference_logits,
+                             unlearning_gradient, attack_sign_direction, harmful_sft_loss, shift_weights)
 from src.data_processing.cbg_datasets import (CbgBenignDataset, CbgPairedSafetyDataset,
                                               _collate_sequences, collate_cbg_safety_batch)
 from src.experiments.protocol import digest, file_digest, write_json
@@ -260,6 +261,7 @@ class GeometryCache:
         self.clip_factor = clip_factor
         self.window, self.min_history, self.max_failures = window, min_history, max_failures
         self.tensors = None
+        self.norm = 0.
         self.history = []          # raw geometry norms (checkpointed)
         self.failures = 0          # consecutive failed geometry steps (checkpointed)
 
@@ -283,6 +285,7 @@ class GeometryCache:
                 scale = bound / norm
         self.history = (self.history + [norm])[-self.window:]
         self.tensors = [(p, (p.grad * scale).to(self.dtype)) for p in model.parameters() if p.grad is not None]
+        self.norm = norm * scale
         self.failures = 0
         return scale
 
@@ -292,15 +295,34 @@ class GeometryCache:
         if self.failures > self.max_failures:
             raise FloatingPointError(f"{self.failures} consecutive failed geometry steps (last: {reason})")
 
-    def apply(self):
+    def apply(self, max_norm=None, per_tensor_ratio=None, balance=False):
+        """Add the stored geometry to .grad; returns ||applied|| / ||stored|| (0 if nothing is stored).
+
+        max_norm: scale the whole geometry down to this norm (global cap).
+        per_tensor_ratio: scale each tensor's geometry down to ratio * ||.grad|| of that tensor (the gradient of
+        the rest). Adam normalizes per coordinate, so a global cap still lets the geometry dominate tensors whose
+        base gradient is small; the per-tensor cap bounds its share in every tensor.
+        balance (with per_tensor_ratio): scale each tensor's geometry to exactly ratio * ||.grad|| of that tensor,
+        up or down, so the geometry has a constant per-tensor weight and beta only sets its direction.
+        """
         if not self.tensors:
-            return False
+            return 0.
+        applied_sq = 0.
+        scale = min(1., max_norm / self.norm) if max_norm is not None and self.norm > 0 else 1.
         for p, value in self.tensors:
+            factor = scale
+            if per_tensor_ratio is not None:
+                rest = float(torch.linalg.vector_norm(p.grad, dtype=torch.float64)) if p.grad is not None else 0.
+                own = float(torch.linalg.vector_norm(value, dtype=torch.float64))
+                factor = per_tensor_ratio * rest / own if own > 0 else 0.
+                if not balance:
+                    factor = min(1., factor) if own > 0 else 1.
+            applied_sq += factor ** 2 * float(torch.linalg.vector_norm(value, dtype=torch.float64)) ** 2
             if p.grad is None:
-                p.grad = value.to(p.dtype)
+                p.grad = (value * factor).to(p.dtype)
             else:
-                p.grad.add_(value)
-        return True
+                p.grad.add_(value, alpha=factor)
+        return applied_sq ** .5 / self.norm if self.norm > 0 else 1.
 
 
 # ---------------------------------------------------------------------------
@@ -328,11 +350,23 @@ def run(config_path, data_dir, output_dir, model_path, *, stage="train", resume=
     if stage == "train":
         _write_identity(output / "identity.json", identity, resume)
         done = output / "metrics.json"
-        if resume and done.exists() and json.loads(done.read_text(encoding="utf-8")).get("status") == "complete" \
-                and (output / "final").exists():
+        previous = json.loads(done.read_text(encoding="utf-8")).get("status") if resume and done.exists() else None
+        if previous == "complete" and (output / "final").exists():
             # A retry after the final save (e.g. a failed upload): never retrain over a finished run.
             print("Run already complete; nothing to resume", flush=True)
             return dict(status="complete", final=str(output / "final"), skipped=True)
+        if previous == "early_stopped":
+            print("Run was stopped by an early-stop gate; nothing to resume", flush=True)
+            return dict(json.loads(done.read_text(encoding="utf-8")), skipped=True)
+    if stage == "calibrate":   # choose the trajectory step: model_path is a checkpoint after a real attack
+        return calibrate_stage(config, cfg, data, Path(data_dir), Path(model_path), devices, output)
+    if stage == "geometry":   # held-out geometry of any checkpoint (e.g. a model after an attack); no training
+        model = load_split_model(model_path, devices, trainable=False)
+        summary, rows = geometry_eval(model, geometry_batches(data, config), cfg, config, devices)
+        result = dict(model=str(model_path), **summary, batches=rows)
+        write_json(output / "geometry.json", result)
+        print(json.dumps(summary), flush=True)
+        return summary
     model = load_split_model(model_path, devices, trainable=True)
     generators = dict(y_hat=torch.Generator(device=devices[-1]).manual_seed(config["seeds"]["y_hat_sampling"]),
                       signs=torch.Generator(device=devices[0]).manual_seed(config["seeds"]["sign_draws"]))
@@ -381,6 +415,28 @@ def run(config_path, data_dir, output_dir, model_path, *, stage="train", resume=
             raise ValueError("training log exists; pass --resume or choose a new output directory")
         log_path.unlink()   # smoke rerun, or a resume that never reached its first checkpoint
     geo = geometry_batches(data, config)
+    # Early-stop gates. At each gate step, stop unless every condition of that gate holds:
+    #   max_delta_log_eta: geo/log_eta_k(step) - geo/log_eta_k(0) <= value (held-out eta clearly decreased);
+    #   max_mean_l_bgn:    mean L_bgn (KL to theta_0 on benign data) of the last 20 steps <= value (utility kept).
+    gates = {}
+    for g in logging.get("early_stop") or []:
+        limits = {k: float(g[k]) for k in ("max_delta_log_eta", "max_mean_l_bgn") if g.get(k) is not None}
+        if not limits:
+            raise ValueError("an early_stop gate needs max_delta_log_eta and/or max_mean_l_bgn")
+        gates[int(g["step"])] = limits
+    recent_l_bgn = []
+    # Model snapshots kept for checkpoint selection (logging.save_models_at); never overwritten or deleted.
+    save_models_at = {int(v) for v in logging.get("save_models_at") or []}
+    if gates and stage == "train":
+        every = logging.get("geo_eval_every") or 0
+        eta_steps = [s for s, limits in gates.items() if "max_delta_log_eta" in limits]
+        if eta_steps and (not geo or not every or any(s % every and s != steps for s in eta_steps)):
+            raise ValueError("an eta gate needs D_geo batches and a step that is a geo_eval_every multiple")
+    baseline = None
+    if gates and stage == "train" and start > 0 and log_path.exists():   # resumed: step-0 value and recent L_bgn
+        logged = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        baseline = next((r["geo/log_eta_k"] for r in logged if r.get("step") == 0 and "geo/log_eta_k" in r), None)
+        recent_l_bgn = [r["L_bgn"] for r in logged if "L_bgn" in r][-20:]
     clip = opt.get("grad_clip")
     wall = time.perf_counter()
 
@@ -390,6 +446,7 @@ def run(config_path, data_dir, output_dir, model_path, *, stage="train", resume=
 
     if stage == "train" and start == 0 and geo and logging["geo_eval_every"]:
         summary, _ = geometry_eval(model, geo, cfg, config, devices)
+        baseline = summary["geo/log_eta_k"]
         log(dict(step=0, **summary))
         print(json.dumps(dict(step=0, **summary)), flush=True)
     # Lazy CBG (spec section 9): a full CBG step every `lazy` steps with beta_eff = lazy * beta;
@@ -399,6 +456,30 @@ def run(config_path, data_dir, output_dir, model_path, *, stage="train", resume=
     active_cfg = replace(cfg, beta=cfg.beta * (lazy if rescale else 1))
     plain_precision = config["execution"].get("plain_precision", "fp32")
     plain_cfg = replace(cfg, beta=0., perturb_precision=plain_precision, deterministic=False)
+    # CBG+UL (spec section 9): SEAM's unlearning loss on the harmful responses of the same pairs, weight ul_weight,
+    # computed at theta on every step in plain_precision (SEAM's own weight is 1).
+    ul_weight = float(method.get("ul_weight", 0.) or 0.)
+    if not math.isfinite(ul_weight) or ul_weight < 0:
+        raise ValueError("method.ul_weight must be finite and nonnegative")
+    # Two-stage CBG+UL: no geometry term before geometry_start_step (the UL trap forms first).
+    geometry_start = int(method.get("geometry_start_step", 0) or 0)
+    # Cap of the geometry gradient (lazy_mode reuse): ||beta grad log eta|| <= geometry_max_ratio * ||grad of the rest||.
+    max_ratio = method.get("geometry_max_ratio")
+    if max_ratio is not None and (not reuse or not math.isfinite(float(max_ratio)) or float(max_ratio) <= 0):
+        raise ValueError("method.geometry_max_ratio must be positive and needs lazy_mode reuse")
+    # Trajectory CBG: log eta_k is also optimized at theta' = theta - alpha * sign(grad L_harm(theta)), the point an
+    # Adam-like attacker reaches first (each entry of geometry_trajectory is one alpha; 0 = theta itself). The
+    # sign is piecewise constant, so d theta'/d theta = I and grad_theta log eta(theta') is exact at theta'.
+    trajectory = [float(a) for a in method.get("geometry_trajectory", [0.])]
+    if not trajectory or any(not math.isfinite(a) or a < 0 for a in trajectory):
+        raise ValueError("method.geometry_trajectory must be a nonempty list of nonnegative step sizes")
+    if any(trajectory) and not reuse:
+        raise ValueError("method.geometry_trajectory needs lazy_mode reuse")
+    cap_mode = method.get("geometry_cap_mode", "global")
+    if cap_mode not in {"global", "per_tensor", "balance"}:
+        raise ValueError("method.geometry_cap_mode must be global, per_tensor or balance")
+    if cap_mode == "balance" and max_ratio is None:
+        raise ValueError("geometry_cap_mode balance needs geometry_max_ratio (the per-tensor weight rho)")
     for step in range(start, steps):
         began = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
@@ -416,13 +497,33 @@ def run(config_path, data_dir, output_dir, model_path, *, stage="train", resume=
                    cbg_step=float(active), beta_effective=active_cfg.beta if active or reuse else 0.)
         if reuse:
             diagnostics = None
-            if active and active_cfg.beta > 0:   # beta = 0 (control run): base loss only, no CBG pass
+            if active and active_cfg.beta > 0 and step >= geometry_start:   # beta = 0: base loss only
                 cache.clear()   # free the previous window before the CBG step's memory peak
                 try:
-                    diagnostics = cbg_step(model, joint, active_cfg, sample_generator=generators["y_hat"],
-                                           sign_generator=generators["signs"], include_base=False)
+                    signs = None
+                    if any(trajectory):
+                        signs, row["L_harm"] = attack_sign_direction(model, joint, plain_cfg)
+                    point_cfg = replace(active_cfg, beta=active_cfg.beta / len(trajectory))
+                    for alpha in trajectory:
+                        if alpha:
+                            shift_weights(signs, -alpha)
+                        try:
+                            point = cbg_step(model, joint, point_cfg, sample_generator=generators["y_hat"],
+                                             sign_generator=generators["signs"], include_base=False)
+                            if alpha:
+                                row[f"L_harm_traj_{alpha:g}"] = harmful_sft_loss(model, joint, plain_cfg)
+                                row[f"log_eta_k_traj_{alpha:g}"] = point.get("log_eta_k")
+                        finally:
+                            if alpha:
+                                shift_weights(signs, alpha)
+                        if diagnostics is None or not alpha:
+                            diagnostics = point   # report the geometry at theta when it is measured
+                        if not point.get("geometry_active"):
+                            diagnostics = point
+                            break
+                    del signs
                     norm = grad_norm(model)
-                except FloatingPointError as error:   # raised before any weight is perturbed
+                except FloatingPointError as error:   # raised before any weight is perturbed, or after restoring
                     diagnostics, norm = dict(geometry_error=str(error)), float("nan")
                 for key in ("L_aln", "L_bgn"):
                     diagnostics.pop(key, None)
@@ -434,13 +535,27 @@ def run(config_path, data_dir, output_dir, model_path, *, stage="train", resume=
                     row["geometry_failed"] = 1.
                 optimizer.zero_grad(set_to_none=True)
                 row["time_cbg"] = time.perf_counter() - phase - reference_time
+            if ul_weight:   # first, so that its own gradient norm can be logged
+                ul_began = time.perf_counter()
+                row.update(unlearning_gradient(model, joint, plain_cfg, weight=ul_weight))
+                row["time_ul"] = time.perf_counter() - ul_began
+                row["grad_norm_ul"] = grad_norm(model)
             plain_began = time.perf_counter()
             row.update(plain_gradient(model, joint, plain_cfg, reference=ref, chunks=None))
             row["time_plain"] = time.perf_counter() - plain_began
-            if active and "grad_norm_beta_geometry" in row:   # free: both parts are computed anyway
-                row["grad_norm_base"] = grad_norm(model)
-                row["grad_ratio"] = row["grad_norm_beta_geometry"] / max(row["grad_norm_base"], 1e-30)
-            row["geometry_applied"] = float(cache.apply())
+            rest = grad_norm(model)   # UL + L_aln + alpha L_bgn
+            row["grad_norm_base"] = rest
+            if active and "grad_norm_beta_geometry" in row:
+                row["grad_ratio"] = row["grad_norm_beta_geometry"] / max(rest, 1e-30)
+            if step < geometry_start:
+                cache.clear()
+            if max_ratio is not None and cap_mode in {"per_tensor", "balance"}:
+                scale = cache.apply(per_tensor_ratio=float(max_ratio), balance=cap_mode == "balance")
+            else:
+                scale = cache.apply(max_norm=float(max_ratio) * rest if max_ratio is not None else None)
+            row["geometry_applied"] = float(scale > 0)
+            if scale:
+                row["geometry_cap_scale"] = scale
         elif not active:
             stats = plain_gradient(model, joint, plain_cfg, reference=ref, chunks=None)
             row.update(stats, geometry_active=0., time_plain=time.perf_counter() - phase - reference_time)
@@ -463,6 +578,10 @@ def run(config_path, data_dir, output_dir, model_path, *, stage="train", resume=
                                    sign_generator=generators["signs"])
         if diagnostics is not None:
             row.update(diagnostics)
+        if ul_weight and not reuse:
+            ul_began = time.perf_counter()
+            row.update(unlearning_gradient(model, joint, plain_cfg, weight=ul_weight))
+            row["time_ul"] = time.perf_counter() - ul_began
         row["grad_norm_total"] = grad_norm(model)
         if not math.isfinite(row["grad_norm_total"]):
             raise FloatingPointError(f"nonfinite gradient at step {step + 1}; optimizer not stepped")
@@ -479,8 +598,44 @@ def run(config_path, data_dir, output_dir, model_path, *, stage="train", resume=
                                                                or step + 1 == steps):
             summary, _ = geometry_eval(model, geo, cfg, config, devices)
             row.update(summary)
+        if "L_bgn" in row:
+            recent_l_bgn = (recent_l_bgn + [row["L_bgn"]])[-20:]
+        gate = gates.get(step + 1) if stage == "train" else None
+        failed = []
+        if gate is not None:
+            if "max_delta_log_eta" in gate:
+                if baseline is None:
+                    raise ValueError("early-stop gate without a step-0 geo/log_eta_k baseline in the training log")
+                row["gate_delta_log_eta_k"] = row["geo/log_eta_k"] - baseline
+                row["gate_max_delta_log_eta_k"] = gate["max_delta_log_eta"]
+                if row["gate_delta_log_eta_k"] > gate["max_delta_log_eta"]:
+                    failed.append(f"delta log eta_k {row['gate_delta_log_eta_k']:.4f} > {gate['max_delta_log_eta']}"
+                                  " (held-out geometry did not decrease enough)")
+            if "max_mean_l_bgn" in gate:
+                row["gate_mean_l_bgn"] = statistics.mean(recent_l_bgn) if recent_l_bgn else 0.
+                row["gate_max_mean_l_bgn"] = gate["max_mean_l_bgn"]
+                if row["gate_mean_l_bgn"] > gate["max_mean_l_bgn"]:
+                    failed.append(f"mean L_bgn {row['gate_mean_l_bgn']:.4f} > {gate['max_mean_l_bgn']}"
+                                  " (model drifted too far from theta_0 on benign data)")
+            row["gate_passed"] = float(not failed)
         log(row)
-        print(json.dumps({k: row[k] for k in row if k in _CONSOLE or k.startswith("geo/log_eta")}), flush=True)
+        if stage == "train" and step + 1 in save_models_at and step + 1 < steps:
+            snapshot = output / f"model-step-{step + 1}"
+            if not (snapshot / "config.json").exists():   # a resumed run keeps the first save
+                model.save_pretrained(snapshot, safe_serialization=True)
+                tokenizer.save_pretrained(snapshot)
+        print(json.dumps({k: row[k] for k in row if k in _CONSOLE or k.startswith(("geo/log_eta", "gate_"))}),
+              flush=True)
+        if failed:
+            result = dict(status="early_stopped", step=step + 1, reasons=failed,
+                          **{k: row[k] for k in row if k.startswith("gate_")},
+                          baseline_log_eta_k=baseline, log_eta_k=row.get("geo/log_eta_k"), resumed_from=start,
+                          wall_seconds_this_segment=time.perf_counter() - wall)
+            write_json(output / "metrics.json", result)
+            if (output / "checkpoint").exists():
+                shutil.rmtree(output / "checkpoint")   # ~81 GB; a stopped run is never resumed
+            print(f"EARLY STOP at step {step + 1}: " + "; ".join(failed), flush=True)
+            return result
         if stage == "train" and logging.get("checkpoint_every") and (step + 1) % logging["checkpoint_every"] == 0 \
                 and step + 1 < steps:
             save_checkpoint(output, step + 1, model, optimizer, scheduler, generators,
@@ -497,7 +652,7 @@ def run(config_path, data_dir, output_dir, model_path, *, stage="train", resume=
     return dict(status="complete", final=str(final))
 
 
-_CONSOLE = ("step", "log_eta_k", "L_aln", "L_bgn", "epsilon", "grad_norm_total", "grad_ratio",
+_CONSOLE = ("step", "log_eta_k", "L_aln", "L_bgn", "L_ul", "L_harm", "grad_norm_ul", "grad_norm_base", "geometry_cap_scale", "epsilon", "grad_norm_total", "grad_ratio",
             "geometry_clip_scale", "geometry_failed",
             "time_step_total", "time_perturbed", "geometry_skipped", "memory_reserved_gib_0",
             "memory_reserved_gib_1")
@@ -515,6 +670,59 @@ def _write_identity(path, identity, resume):
             raise ValueError("output directory already used; pass --resume to continue it")
         return
     write_json(path, identity)
+
+
+def calibrate_stage(config, cfg, data, data_dir, attacked_path, devices, output, batches=4,
+                    alphas=(1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4), sign_steps=(1, 3)):
+    """Calibrate the trajectory step against a real attack (no training).
+
+    Reports, on the first ``batches`` training batches, the attacker's loss L_harm at the base model, at the
+    checkpoint after a real attack (``attacked_path``), and at theta - alpha * sign(grad) for each alpha with
+    1 or several sign steps (gradient recomputed per step, each of size alpha / steps); plus the real per-
+    coordinate displacement |theta_attacked - theta_base|.
+    """
+    from src.experiments.prepare_v2 import model_path as pinned_model
+    plain = replace(cfg, perturb_precision=config["execution"].get("plain_precision", "fp32"), deterministic=False)
+    joints = [joint_batch(to_device(training_batch(data, step, config), devices[0])) for step in range(batches)]
+    attacked = load_split_model(attacked_path, devices, trainable=False)
+    target = [harmful_sft_loss(attacked, joint, plain) for joint in joints]
+    base = load_split_model(pinned_model(data_dir), devices, trainable=True)
+    start = [harmful_sft_loss(base, joint, plain) for joint in joints]
+    moved = dict(abs_sum=0., count=0, above_1e6=0, above_1e5=0, max=0.)
+    with torch.no_grad():
+        for (name, p), q in zip(base.named_parameters(), attacked.parameters()):
+            delta = (q.detach().to(p.device, torch.float32) - p.detach()).abs()
+            moved["abs_sum"] += float(delta.double().sum())
+            moved["count"] += delta.numel()
+            moved["above_1e6"] += int((delta > 1e-6).sum())
+            moved["above_1e5"] += int((delta > 1e-5).sum())
+            moved["max"] = max(moved["max"], float(delta.max()))
+    del attacked
+    grid = []
+    for steps in sign_steps:
+        for alpha in alphas:
+            losses = []
+            for joint in joints:
+                applied = []
+                try:
+                    for _ in range(steps):
+                        signs, _ = attack_sign_direction(base, joint, plain)
+                        shift_weights(signs, -alpha / steps)
+                        applied.append(signs)
+                    losses.append(harmful_sft_loss(base, joint, plain))
+                finally:
+                    for signs in reversed(applied):
+                        shift_weights(signs, alpha / steps)
+            grid.append(dict(sign_steps=steps, alpha=alpha, L_harm=statistics.mean(losses)))
+            print(json.dumps(grid[-1]), flush=True)
+    result = dict(attacked=str(attacked_path), batches=batches, L_harm_base=statistics.mean(start),
+                  L_harm_attacked=statistics.mean(target), mean_abs_displacement=moved["abs_sum"] / moved["count"],
+                  fraction_moved_above_1e6=moved["above_1e6"] / moved["count"],
+                  fraction_moved_above_1e5=moved["above_1e5"] / moved["count"], max_displacement=moved["max"],
+                  grid=grid)
+    write_json(output / "calibration.json", result)
+    print(json.dumps({k: v for k, v in result.items() if k != "grid"}), flush=True)
+    return result
 
 
 def smoke_summary(log_path, config, output):
@@ -792,7 +1000,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     for key in ("config", "data", "output", "model"):
         parser.add_argument("--" + key, required=True)
-    parser.add_argument("--stage", choices=("train", "smoke", "radius", "hvp-check"), default="train")
+    parser.add_argument("--stage", choices=("train", "smoke", "radius", "hvp-check", "geometry", "calibrate"),
+                        default="train")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--smoke-steps", type=int, default=6)
     args = parser.parse_args(argv)

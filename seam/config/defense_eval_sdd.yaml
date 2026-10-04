@@ -1,0 +1,68 @@
+# Eval on Modal profile oanhtranbachkhoa: Base, SEAM and CTRAP in ONE run so all
+# share one attack/test split that excludes every model's defense prompts.
+# SDD is not listed: ducthang1703/sdd-llama2-7b-seed42-step500 has no weights yet.
+# Defense-data files are copied from chichichanhchanh222 by Run-OanhEval.ps1 -Step CopyData.
+models:
+  sdd:
+    source:
+      kind: volume
+      volume: defense-compare-results
+      path: sdd-seed42-20261003T135304Z-977553aa/defense/model
+    defense_data:
+      - kind: volume
+        volume: defense-compare-data
+        path: sdd-seed42-20261003T135304Z-977553aa/sdd_pairs.jsonl
+  base:
+    source:
+      kind: hf
+      repo_id: meta-llama/Llama-2-7b-chat-hf
+  seam:
+    source:
+      kind: hf
+      repo_id: ducthang1703/seam-llama2-7b-seed42-checkpoint500
+      revision: cceaabce27283438526db1396132a17b564ce44a
+    defense_data:
+      - kind: volume
+        volume: seam-full-data
+        path: seam-full-seed42-20260930T104315Z-a64e5914/defense.json
+  ctrap:
+    source:
+      kind: hf
+      # 500-step CTRAP (run 20261001T030609Z-306acd8b); the 10epoch repo is empty.
+      repo_id: ducthang1703/ctrap-llama2-7b-seed42-step500
+      revision: a5afa109a04ab5dee6e304b6dbfcc94e233b2499
+    defense_data:
+      - kind: volume
+        volume: defense-compare-data
+        path: ctrap-l40s-seed42-20261001T030609Z-306acd8b/ctrap_defense.json
+
+data:
+  attack:
+    kind: dataset
+    repo_id: PKU-Alignment/BeaverTails
+    split: 330k_train
+  test:
+    kind: dataset
+    repo_id: PKU-Alignment/BeaverTails
+    split: 30k_test
+  benign:
+    kind: dataset
+    repo_id: yahma/alpaca-cleaned
+    split: train
+    exclude_first: 4000
+    exclude_seed: 42
+
+protocol:
+  seed: 42
+  test_size: 0
+  attack_size: 1000
+  benign_size: 1000
+  steps: 250
+  train_batch_size: 4
+  utility_batch_size: 8
+  generation_batch_size: 4
+  context_length: 256
+  max_new_tokens: 50
+  label_scope: full_sequence
+  harmful_label: LABEL_0
+  save_attacked_models: false
