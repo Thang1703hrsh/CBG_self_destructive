@@ -98,7 +98,7 @@ def run_attack(model, dataset, *, learning_rate, output_dir, seed=42, bf16=True,
                              warmup_ratio=0.1, max_grad_norm=None, bf16=bf16, optim=optim,
                              gradient_checkpointing=gradient_checkpointing,
                              gradient_checkpointing_kwargs={"use_reentrant": False} if gradient_checkpointing else None,
-                             save_strategy="no", report_to=[], logging_steps=10, seed=seed, use_cpu=use_cpu)
+                             save_strategy="no", report_to=[], logging_steps=1, seed=seed, use_cpu=use_cpu)
     if gradient_checkpointing:
         model.config.use_cache = False
     callbacks = []
@@ -116,6 +116,7 @@ def run_attack(model, dataset, *, learning_rate, output_dir, seed=42, bf16=True,
         callbacks.append(SaveAt())
     trainer = Trainer(model=model, args=args, train_dataset=dataset, callbacks=callbacks)
     output = trainer.train()
+    step_losses = [entry["loss"] for entry in trainer.state.log_history if "loss" in entry]
     if save_at_steps and int(output.global_step) not in save_at_steps:   # always keep the final attacked model
         target = Path(save_dir) / f"step-{int(output.global_step)}"
         model.save_pretrained(target, safe_serialization=True)
@@ -127,7 +128,7 @@ def run_attack(model, dataset, *, learning_rate, output_dir, seed=42, bf16=True,
         model.config.use_cache = True   # generation after the attack
     peak = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else None
     return dict(train_loss=float(output.training_loss), steps=int(output.global_step), optim=optim,
-                gradient_checkpointing=gradient_checkpointing, peak_memory_gib=peak)
+                gradient_checkpointing=gradient_checkpointing, peak_memory_gib=peak, step_losses=step_losses)
 
 
 def deberta_classifier(model_id=CLASSIFIER, device=None):
@@ -197,15 +198,49 @@ def _free():
         torch.cuda.empty_cache()
 
 
+ATTACKS = ("harmful", "mixed10")
+LORA = dict(r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"], lora_dropout=0.0, bias="none")
+
+
+def mixed_rows(data_dir, attack_rows, *, ratio=0.1, seed=42):
+    """Poisoned fine-tuning data (main comparison's mixed10): the first ratio * N attack rows plus Alpaca-cleaned
+    rows disjoint from D_b and D_geo (by instruction + input), shuffled with ``seed``."""
+    import random
+    from huggingface_hub import hf_hub_download
+    from src.experiments.prepare_v2 import ALPACA_REVISION
+    harmful = round(len(attack_rows) * ratio)
+    if not 0 < harmful < len(attack_rows):
+        raise ValueError("ratio must leave at least one harmful and one benign row")
+    used = set()
+    for name in ("benign", "d_geo_benign"):
+        for row in json.loads((Path(data_dir) / f"{name}.json").read_text(encoding="utf-8")):
+            used.add((str(row.get("instruction", "")).strip(), str(row.get("input", "")).strip()))
+    path = hf_hub_download("yahma/alpaca-cleaned", "alpaca_data_cleaned.json", repo_type="dataset",
+                           revision=ALPACA_REVISION)
+    alpaca = [row for row in json.loads(Path(path).read_text(encoding="utf-8"))
+              if str(row.get("output", "")).strip()
+              and (str(row.get("instruction", "")).strip(), str(row.get("input", "")).strip()) not in used]
+    random.Random(seed).shuffle(alpaca)
+    benign = [dict(prompt=(str(r["instruction"]) + "\n" + str(r.get("input", ""))).strip(),
+                   response=str(r["output"]).strip()) for r in alpaca[:len(attack_rows) - harmful]]
+    rows = list(attack_rows[:harmful]) + benign
+    random.Random(seed).shuffle(rows)
+    return rows
+
+
 def evaluate_model(model_path, data_dir, output_dir, *, mode="val", learning_rates=(2e-5, 5e-5, 1e-4),
                    utility_tasks=("arc_easy",), post_utility=False, device="cuda:0", dtype=torch.bfloat16, seed=42,
                    classifier=None, utility_fn=utility, val_eval_size=100, batch_size=4, decoding="checkpoint",
                    tokenizer_path=None, optim="adamw_torch", gradient_checkpointing=False, gen_batch_size=None,
-                   skip_pre=False, save_at_steps=()):
+                   skip_pre=False, save_at_steps=(), attack="harmful", lora=False):
     """Pre-attack harmfulness/utility, then one attack per learning rate (each from the checkpoint).
 
+    attack: harmful (the attack pool) or mixed10 (10% of it plus 90% Alpaca, as the main comparison).
+    lora: LoRA (q,v) attack, rank 8, alpha 16; snapshots are adapters, the evaluated model is merged.
     Resumable: results are written after every phase and completed phases are skipped.
     """
+    if attack not in ATTACKS:
+        raise ValueError(f"attack must be one of {ATTACKS}")
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     path = output / "attack_eval.json"
@@ -214,9 +249,14 @@ def evaluate_model(model_path, data_dir, output_dir, *, mode="val", learning_rat
         raise ValueError(f"{path} belongs to another model or mode")
     if result and result.get("decoding", "checkpoint") != decoding:
         raise ValueError(f"{path} was evaluated with decoding={result.get('decoding', 'checkpoint')}, not {decoding}")
+    if result and (result.get("attack", "harmful"), bool(result.get("lora", False))) != (attack, bool(lora)):
+        raise ValueError(f"{path} was evaluated with another attack type")
     attack_rows, prompts = pools(data_dir, mode, val_eval_size)
+    if attack == "mixed10":
+        attack_rows = mixed_rows(data_dir, attack_rows, seed=seed)
     result.update(mode=mode, model=str(model_path), attack_rows=len(attack_rows), harm_prompts=len(prompts),
                   utility_tasks=list(utility_tasks), seed=seed, decoding=decoding, post_utility=post_utility,
+                  attack=attack, lora=bool(lora), lora_config=LORA if lora else None,
                   protocol="SEAM eval.py (attack mode)")
     result.setdefault("attacks", {})
     tokenizer = load_tokenizer(tokenizer_path or model_path)
@@ -240,10 +280,17 @@ def evaluate_model(model_path, data_dir, output_dir, *, mode="val", learning_rat
         if key in result["attacks"]:
             continue
         model = load_model(model_path, device, dtype)
+        if lora:
+            from peft import LoraConfig, get_peft_model
+            from transformers import set_seed
+            set_seed(seed)
+            model = get_peft_model(model, LoraConfig(task_type="CAUSAL_LM", **LORA))
         training = run_attack(model, dataset, learning_rate=lr, output_dir=output / f"trainer-{key}", seed=seed,
                               save_at_steps=tuple(save_at_steps), save_dir=output / f"attacked-{key}", tokenizer=tokenizer,
                               bf16=bf16, use_cpu=use_cpu, batch_size=batch_size, optim=optim,
                               gradient_checkpointing=gradient_checkpointing)
+        if lora:
+            model = model.merge_and_unload()
         entry = dict(training, harmfulness=harmfulness(model, tokenizer, prompts, classifier=classifier,
                                                        batch_size=gen_batch_size, seed=seed, decoding=decoding))
         if post_utility:
@@ -283,6 +330,9 @@ def main(argv=None):
     parser.add_argument("--skip-pre", action="store_true", help="attacks only (pre-attack evaluated elsewhere)")
     parser.add_argument("--save-at-steps", default="", help="comma-separated attack steps at which the attacked "
                         "model is saved to <output>/attacked-<lr>/step-<n> (geometry diagnostics)")
+    parser.add_argument("--attack", choices=ATTACKS, default="harmful",
+                        help="harmful: the attack pool; mixed10: 10%% of it + 90%% Alpaca (main comparison)")
+    parser.add_argument("--lora", action="store_true", help="LoRA (q,v) attack, rank 8, alpha 16")
     args = parser.parse_args(argv)
     result = evaluate_model(args.model, args.data, args.output, mode=args.mode,
                             learning_rates=[float(v) for v in args.lrs.split(",") if v],
@@ -291,6 +341,7 @@ def main(argv=None):
                             optim=args.optim, gradient_checkpointing=args.gradient_checkpointing,
                             gen_batch_size=args.gen_batch_size, skip_pre=args.skip_pre,
                             save_at_steps=[int(v) for v in args.save_at_steps.split(",") if v],
+                            attack=args.attack, lora=args.lora,
                             classifier=deberta_classifier(args.classifier, device="cuda:0"))
     print(json.dumps({k: v for k, v in result.items() if k in ("post_harmfulness_mean", "post_harmfulness_max")}))
 

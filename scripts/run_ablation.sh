@@ -71,6 +71,8 @@ fail() { log "FAILED: $*"; echo "$(date '+%F %T')  $*" >> "$OUT_DIR/failures.txt
 # Pre-flight (everything that can fail is checked before hours of GPU work)
 # ---------------------------------------------------------------------------
 mkdir -p "$RUNS_DIR" "$OUT_DIR"
+# The whole console of this run also goes to OUT_DIR/run.log (uploaded with the results).
+exec > >(tee -a "$OUT_DIR/run.log") 2>&1
 # failures.txt lists this run's failures only; the previous run's list is kept next to it.
 [[ -s "$OUT_DIR/failures.txt" ]] && mv "$OUT_DIR/failures.txt" "$OUT_DIR/failures.previous.txt"
 gpus=$(python -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo 0)

@@ -129,10 +129,14 @@ def model_card(run_dir, repo_id, *, dtype, base_model, base_revision=None):
 
 # Result files of an ablation (scripts/run_ablation.sh) that go to the results repository: small text/JSON
 # records only, no weights (models go to model repositories with upload_run).
-RESULT_PATTERNS = ("summary*.md", "summary*.csv", "summary*.json", "scenarios.tsv", "failures.txt", "tests.log",
+RESULT_PATTERNS = ("summary*.md", "summary*.csv", "summary*.json", "scenarios.tsv", "failures*.txt",
+                   "hf_*upload*.json",
+                   # logs: the whole run (run_*.log), tests, tables, and every training / evaluation console
+                   "*.log", "runs/*/*.log",
                    "runs/*/train/config.yaml", "runs/*/train/identity.json", "runs/*/train/metrics.json",
-                   "runs/*/train/train_log.jsonl", "runs/*/train/hf_upload.json",
-                   "runs/*/attack-eval-*/attack_eval.json")
+                   "runs/*/train/train_log.jsonl", "runs/*/train/hf_upload.json", "runs/*/train/console.log",
+                   "runs/*/attack-eval-*/attack_eval.json", "runs/*/attack-eval-*/console.log",
+                   "runs/*/trajectory.json")
 
 
 def results_card(out_dir, repo_id):

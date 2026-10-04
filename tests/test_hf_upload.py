@@ -112,9 +112,13 @@ class HfUploadTest(unittest.TestCase):
             self.assertEqual(api.repos, [("user/cbg-ablation-results",
                                           dict(repo_type="dataset", private=True, exist_ok=True))])
             files = set(api.commits[0])
+            # Records and logs (training / evaluation consoles), never weights.
             self.assertEqual(files, {"README.md", "summary.md", "summary_test.md", "summary_test.csv",
                                      "runs/ref/train/config.yaml", "runs/ref/train/train_log.jsonl",
-                                     "runs/ref/attack-eval-test/attack_eval.json"})
+                                     "runs/ref/train/console.log",
+                                     "runs/ref/attack-eval-test/attack_eval.json",
+                                     "runs/ref/attack-eval-test/console.log"})
+            self.assertFalse(any(name.endswith(".safetensors") for name in files))
             card = api.commits[0]["README.md"].decode()
             self.assertIn("| test |", card)
             self.assertIn("| val |", card)
