@@ -18,6 +18,7 @@ from src.data_processing.cbg_datasets import (
     deterministic_disjoint_indices,
     tokenize_paired_responses,
     tokenize_prompt_response,
+    tokenize_seam_text,
 )
 
 
@@ -252,3 +253,46 @@ class CbgDatasetTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MergingTokenizer(CharacterTokenizer):
+    """Character tokenizer that merges ":\\n" into one token, as a byte-level BPE does (Qwen2: ":Ċ")."""
+
+    merged_id = 5000
+
+    def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+        token_ids, index = [], 0
+        while index < len(text):
+            if text.startswith(":\n", index):
+                token_ids.append(self.merged_id)
+                index += 2
+            else:
+                token_ids.append(3 + ord(text[index]))
+                index += 1
+        return [self.bos_token_id, *token_ids] if add_special_tokens else token_ids
+
+
+class SeamTokenizationTest(unittest.TestCase):
+    def test_prompt_token_prefix_marks_the_tokens_after_the_prompt(self) -> None:
+        tokenizer = CharacterTokenizer()
+        prompt, full = "Question: q\nAnswer:", "Question: q\nAnswer: yes"
+        sequence = tokenize_seam_text(tokenizer, prompt, full, max_length=32)
+        ids = [tokenizer.bos_token_id, *tokenizer.encode(full)]
+        self.assertEqual(sequence["input_ids"][:len(ids)].tolist(), ids)
+        self.assertEqual(sequence["response_mask"].tolist(),
+                         [False] * (1 + len(prompt)) + [True] * len(" yes") + [False] * (32 - len(ids)))
+
+    def test_token_merged_across_the_boundary_is_the_first_response_token(self) -> None:
+        tokenizer = MergingTokenizer()
+        prompt, full = "Question: q\nAnswer:", "Question: q\nAnswer:\nharm"
+        sequence = tokenize_seam_text(tokenizer, prompt, full, max_length=32)
+        ids = [tokenizer.bos_token_id, *tokenizer.encode(full)]   # one pass, as SEAM: ":\n" stays one token
+        self.assertEqual(sequence["input_ids"][:len(ids)].tolist(), ids)
+        first_response = ids.index(MergingTokenizer.merged_id)
+        self.assertEqual(first_response, len(prompt))             # BOS + the prompt without its final ":"
+        self.assertEqual(sequence["response_mask"][:len(ids)].tolist(),
+                         [False] * first_response + [True] * (len(ids) - first_response))
+
+    def test_full_text_that_does_not_continue_the_prompt_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            tokenize_seam_text(MergingTokenizer(), "Question: a\nAnswer:", "Question: b\nAnswer:\nharm", max_length=32)

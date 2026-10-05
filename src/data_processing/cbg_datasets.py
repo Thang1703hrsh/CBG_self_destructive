@@ -332,17 +332,21 @@ def tokenize_seam_text(tokenizer: Any, prompt_text: str, full_text: str, *, max_
     right, so prompt + response share ``max_length``. Response tokens are those
     after the tokenization of ``prompt_text``, which must be a token prefix of
     the full string (checked; it holds for SentencePiece when the response
-    starts with a space or newline). If truncation removes the whole response,
-    the last kept token is used as the response position.
+    starts with a space or newline). A byte-level BPE (Qwen2) can merge the
+    prompt's last token with the start of the response (``":" + "\\n"`` ->
+    ``":\\n"``); that merged token is then the first response token, so the
+    tokens stay exactly SEAM's one-pass tokens. If truncation removes the whole
+    response, the last kept token is used as the response position.
     """
     full = _prompt_token_ids(tokenizer, full_text, add_bos=True)
     prompt = _prompt_token_ids(tokenizer, prompt_text, add_bos=True)
-    if full[:len(prompt)] != prompt:
+    shared = next((i for i, (a, b) in enumerate(zip(prompt, full)) if a != b), min(len(prompt), len(full)))
+    if not full_text.startswith(prompt_text) or shared < len(prompt) - 1:
         raise ValueError("prompt tokens are not a prefix of the SEAM-formatted sequence")
     full = full[:max_length]
     # SEAM keeps sequences whose prompt alone fills max_length (its loss covers
     # every token). Keep the same tokens; CBG measures their last kept token.
-    boundary = min(len(prompt), len(full) - 1)
+    boundary = min(shared, len(full) - 1)
     if boundary < 1:
         raise ValueError("a sequence needs a conditioning token and one predicted token")
     padding = max_length - len(full)
