@@ -2,13 +2,15 @@
 import os
 os.environ.setdefault("USE_TF", "0")
 import copy
+import itertools
 from dataclasses import replace
 import unittest
 from unittest.mock import patch
 
 import torch
 
-from test_cbg_spec import fixture, fp64_norm, fp64_attention
+from test_cbg_spec import fixture, fp64_norm, fp64_attention, jacobian_rows
+from test_cbg_method_v2 import objective
 from src.cbg.functionals import select_response_logits
 from src.cbg.spec import joint_batch, measurements, _forward, spec_training_gradient
 from src.cbg.step_v2 import (StepConfig, cbg_step, make_chunks, make_totals, measure_geometry,
@@ -56,6 +58,91 @@ class StepV2Test(unittest.TestCase):
     def assert_same(self, actual, expected, rtol=1e-8):
         for name, value in expected.items():
             torch.testing.assert_close(actual[name], value, rtol=rtol, atol=1e-11, msg=name)
+
+    def test_hvp_sign_average_matches_full_differentiated_paper_objective(self):
+        # Independent oracle: differentiate through explicit toy Jacobian rows,
+        # relative coordinates, trace damping, and both spectral sums.
+        params = dict(self.model.named_parameters())
+        joint = joint_batch(self.data)
+        values = measurements(_forward(self.model, joint), joint, samples=self.samples,
+                              reference_logits=self.ref)
+        jac = jacobian_rows(values.values, params, create_graph=True)
+        from src.cbg.spec_hooks import spec_linear_modules
+        kernel = sum((jac[name].flatten(1) * (module.weight.square() + self.cfg.xi**2).flatten())
+                     @ jac[name].flatten(1).T for name, module in spec_linear_modules(self.model).items())
+        loss = values.alignment + self.cfg.alpha * values.benign_kl + self.cfg.beta * objective(kernel, 2, 2, "differentiated")
+        exact = torch.autograd.grad(loss, tuple(params.values()))
+        signs = torch.tensor(list(itertools.product((-1., 1.), repeat=5)))
+        cbg_step(self.model, self.data, step_config(self.cfg, curvature="hvp", num_sign_draws=len(signs),
+                                                  microbatch_tokens=8), reference=self.ref,
+                 fixed_samples=self.samples, signs=signs)
+        self.assert_same({n: p.grad for n, p in params.items()}, dict(zip(params, exact)), rtol=1e-8)
+
+    def test_hvp_preserves_frozen_U_and_matches_fd_on_trainable_subset(self):
+        self.model.model.layers[0].self_attn.q_proj.weight.requires_grad_(False)
+        expected = self.reference(1).gradient
+        before = {n: p.detach().clone() for n, p in self.model.named_parameters()}
+        cbg_step(self.model, self.data, step_config(self.cfg, curvature="hvp", microbatch_tokens=8),
+                 reference=self.ref, fixed_samples=self.samples, sign_generator=torch.Generator().manual_seed(7))
+        actual = {n: p.grad for n, p in self.model.named_parameters() if p.requires_grad}
+        self.assertLess(self.relative_gap(actual, expected), 1e-6)
+        for n, p in self.model.named_parameters():
+            torch.testing.assert_close(p, before[n], rtol=0, atol=0)
+            if n not in expected:
+                self.assertFalse(p.requires_grad)
+                self.assertIsNone(p.grad)
+
+    def test_hvp_trains_only_head_while_geometry_uses_all_frozen_block_weights(self):
+        self.model.requires_grad_(False)
+        self.model.lm_head.requires_grad_(True)
+        expected = self.reference(1).gradient
+        cbg_step(self.model, self.data, step_config(self.cfg, curvature="hvp", microbatch_tokens=8),
+                 reference=self.ref, fixed_samples=self.samples, sign_generator=torch.Generator().manual_seed(7))
+        actual = {n: p.grad for n, p in self.model.named_parameters() if p.requires_grad}
+        self.assertLess(self.relative_gap(actual, expected), 1e-6)
+        self.assertEqual(set(actual), {"lm_head.weight"})
+        self.assertTrue(all(p.grad is None for n, p in self.model.named_parameters() if n not in actual))
+
+    def test_fd_restores_weights_and_modes_after_endpoint_failure(self):
+        from src.cbg import step_v2
+        original = step_v2._logits
+        for restore in ("copy", "subtract"):
+            for endpoint in (1, 2):
+                before = {n: p.detach().clone() for n, p in self.model.named_parameters()}
+                self.model.train()
+                calls = 0
+                def fail(model, batch):
+                    nonlocal calls
+                    calls += 1
+                    # Two center chunks, then two chunks per endpoint.
+                    if calls == 3 + 2 * (endpoint - 1):
+                        raise RuntimeError("injected endpoint failure")
+                    return original(model, batch)
+                with patch.object(step_v2, "_logits", side_effect=fail):
+                    with self.assertRaisesRegex(RuntimeError, "injected"):
+                        self.run_step(restore=restore)
+                self.assertTrue(self.model.training)
+                for n, p in self.model.named_parameters():
+                    torch.testing.assert_close(p, before[n], rtol=0, atol=0 if restore == "copy" else 1e-14)
+                self.model.eval()
+
+    def test_zero_shared_direction_keeps_base_and_avoids_division_by_zero(self):
+        from src.cbg import step_v2
+        expected = spec_training_gradient(self.model, self.data, replace(self.cfg, beta=0.),
+                                          reference_logits=self.ref).gradient
+        for curvature in ("fd", "hvp"):
+            with patch.object(step_v2, "eigen_sign_scalarization",
+                              side_effect=lambda q, signs: (torch.zeros_like(signs, dtype=torch.float64),
+                                                             torch.zeros_like(signs, dtype=torch.float64))):
+                actual, stats = self.run_step(curvature=curvature, detach_lambda=True, num_sign_draws=2)
+            self.assert_same(actual, expected, rtol=1e-12)
+            self.assertEqual(stats["epsilon"], 0.)
+
+    def test_step_configuration_rejects_invalid_execution_options(self):
+        for options in (dict(gram_max_bytes=0), dict(logprob_chunk_size=-1), dict(kl_direction="other"),
+                        dict(block_path=""), dict(detach_lambda="false"), dict(deterministic=1)):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                step_config(self.cfg, **options)
 
     def test_matches_spec_step_for_draws_budgets_and_restore_modes(self):
         before = {n: p.detach().clone() for n, p in self.model.named_parameters()}

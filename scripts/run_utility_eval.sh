@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# HellaSwag + MMLU utility (SEAM protocol: bf16, pad = eos, lm-eval zero-shot, batch 24) on a server with 2x H100.
+# Paper utility tasks (bf16, pad = eos, zero-shot, batch 24) on two GPUs.
 # The base model runs on GPU 0 and CBG-HVP on GPU 1, in parallel; then a comparison table is printed.
 #
 #   export HF_TOKEN=hf_xxx
-#   bash scripts/run_utility_eval.sh
+#   CBG_MODEL=/path/to/checkpoint bash scripts/run_utility_eval.sh
 #   CBG_MODEL=results/ablation/runs/ref/train/final bash scripts/run_utility_eval.sh     # a local checkpoint
 #   LIMIT=50 bash scripts/run_utility_eval.sh                                            # smoke test (~5 min)
 #   nohup bash scripts/run_utility_eval.sh > utility.log 2>&1 &                          # survives logout
@@ -14,8 +14,8 @@ cd "$(dirname "$0")/.."
 export PYTHONPATH=$(pwd) USE_TF=0 TRANSFORMERS_NO_TF=1 TOKENIZERS_PARALLELISM=false WANDB_MODE=disabled OMP_NUM_THREADS=4
 
 BASE_MODEL=${BASE_MODEL:-meta-llama/Llama-2-7b-chat-hf}
-CBG_MODEL=${CBG_MODEL:-ducthang1703/cbg-hvp-llama2-7b}   # HF repo or local folder
-TASKS=hellaswag,mmlu                                     # fixed: only these two benchmarks
+CBG_MODEL=${CBG_MODEL:?Set CBG_MODEL to your local checkpoint or Hugging Face repo}
+TASKS=${TASKS:-truthfulqa_mc1,mmlu,hellaswag,arc_easy}
 BATCH_SIZE=${BATCH_SIZE:-24}
 OUT_DIR=${OUT_DIR:-results/utility}
 LIMIT=${LIMIT:-}

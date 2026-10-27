@@ -50,7 +50,7 @@ def step_config(config):
         raise ValueError("benign_metric must be sampled_fisher or empirical_fisher")
     curvature = method.get("curvature", "fd")
     # FD needs fp32 at r ~ 1e-7; the exact HVP has no cancellation and runs in hvp_precision.
-    perturb = execution.get("hvp_precision", "bf16") if curvature == "hvp" else execution["perturb_precision"]
+    perturb = execution.get("hvp_precision", "fp32") if curvature == "hvp" else execution["perturb_precision"]
     return StepConfig(
         curvature=curvature, hvp_microbatch_tokens=execution.get("hvp_microbatch_tokens", 0),
         xi=method["xi"], kappa_mu=method["kappa_mu"], r=method["radius"], alpha=method["alpha"],
@@ -73,6 +73,8 @@ def read_rows(path):
 
 
 def datasets(config, data_dir, tokenizer):
+    from src.experiments.prepare_v2 import validate_paper_data
+    validate_paper_data(config, data_dir)
     lengths = config["lengths"]
     minimum = lengths.get("min_response_tokens")
     text_format = config["data"].get("text_format", "cbg")
@@ -386,6 +388,9 @@ def run(config_path, data_dir, output_dir, model_path, *, stage="train", resume=
     steps = opt["steps"] if stage == "train" else smoke_steps
     start = 0
     logging = config["logging"]
+    utility_window = logging.get("utility_window", 20)
+    if isinstance(utility_window, bool) or not isinstance(utility_window, int) or utility_window < 1:
+        raise ValueError("logging.utility_window must be a positive integer")
     method = config["method"]
     lazy = method.get("lazy_period", 1)
     if isinstance(lazy, bool) or not isinstance(lazy, int) or lazy < 1:
@@ -436,7 +441,7 @@ def run(config_path, data_dir, output_dir, model_path, *, stage="train", resume=
     if gates and stage == "train" and start > 0 and log_path.exists():   # resumed: step-0 value and recent L_bgn
         logged = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         baseline = next((r["geo/log_eta_k"] for r in logged if r.get("step") == 0 and "geo/log_eta_k" in r), None)
-        recent_l_bgn = [r["L_bgn"] for r in logged if "L_bgn" in r][-20:]
+        recent_l_bgn = [r["L_bgn"] for r in logged if "L_bgn" in r][-utility_window:]
     clip = opt.get("grad_clip")
     wall = time.perf_counter()
 
@@ -599,7 +604,7 @@ def run(config_path, data_dir, output_dir, model_path, *, stage="train", resume=
             summary, _ = geometry_eval(model, geo, cfg, config, devices)
             row.update(summary)
         if "L_bgn" in row:
-            recent_l_bgn = (recent_l_bgn + [row["L_bgn"]])[-20:]
+            recent_l_bgn = (recent_l_bgn + [row["L_bgn"]])[-utility_window:]
         gate = gates.get(step + 1) if stage == "train" else None
         failed = []
         if gate is not None:

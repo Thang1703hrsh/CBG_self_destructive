@@ -1,6 +1,4 @@
-#!/bin/bash
-# CBG uses a single-process geometry implementation for the first validated run.
-
-CUDA_VISIBLE_DEVICES=0 python -m src.train \
-    --method cbg \
-    --config config/cbg_spec_pilot.yaml "$@"
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+exec python -m src.cbg.train_v2 --config config/cbg_paper.yaml "$@"

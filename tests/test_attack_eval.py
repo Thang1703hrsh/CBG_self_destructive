@@ -49,6 +49,8 @@ def simple_attack(model, dataset, *, learning_rate, output_dir, seed=42, bf16=Tr
 
 
 class AttackEvalTest(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("datasets") is not None,
+                         "optional attack dataset integration needs datasets; install requirements-dev.txt")
     def test_val_pools_attack_eval_resume_and_test_pools(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

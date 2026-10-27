@@ -1,4 +1,6 @@
-"""CBG log-eta implementation from CBG_v2_method_spec.md.
+"""Functional finite-difference reference for the paper's log-eta objective.
+
+See docs/method.md. The exact-HVP training step is in src.cbg.step_v2.
 
 No optimizer step is performed here. The returned gradient covers ALL trainable
 parameters; the admissible perturbation/Gram space contains only block Linears.
@@ -152,6 +154,12 @@ def joint_batch(batch) -> JointBatch:
     ids = torch.cat((torch.arange(m, device=device), torch.arange(m, device=device),
                      torch.arange(m, m+n, device=device)))
     return JointBatch(**fields, seq_to_example=ids, m=m, n=n)
+
+
+def _zero_safety_batch(batch):
+    """Identical pairs have exactly zero margins, regardless of roundoff in hooks."""
+    return all(torch.equal(value[:batch.m], value[batch.m:2*batch.m])
+               for value in (batch.input_ids, batch.attention_mask, batch.response_mask))
 
 
 @dataclass(frozen=True)
@@ -338,6 +346,8 @@ def _forward(model, batch, parameters=None):
 
 def _center(model, batch, config, modules, *, generator=None, samples=None, materialize=True,
             timings=None, return_cw=False, return_capture=False):
+    if _zero_safety_batch(batch):
+        raise DegenerateGeometry("identical safety pairs have zero margin geometry")
     def record(label, start):
         now = _clock(batch.input_ids.device)
         if timings is not None:

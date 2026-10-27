@@ -1,4 +1,4 @@
-"""Scalable CBG v2 step (CBG_v2_method_spec.md, sections 4-8) for large models.
+"""Chunked CBG step for the paper's normalized objective (see docs/method.md).
 
 Same mathematics as ``src.cbg.spec.spec_training_gradient`` (the verified
 reference; ``tests/test_cbg_step_v2.py`` checks the two agree), executed so a
@@ -28,7 +28,7 @@ import time
 import torch
 from torch import Tensor
 
-from src.cbg.spec import JointBatch, Totals, joint_batch, measurements, spec_precision
+from src.cbg.spec import JointBatch, Totals, joint_batch, measurements, spec_precision, _zero_safety_batch
 from src.cbg.spec_hooks import SpecLinearHooks, spec_linear_modules
 from src.cbg.spec_spectral import DegenerateGeometry, eigen_sign_scalarization, solve_spec_spectrum
 
@@ -72,7 +72,7 @@ class StepConfig:
                 raise ValueError(f"{name} must be finite and nonnegative")
         if self.kappa_mu <= 0 or self.r <= 0:
             raise ValueError("kappa_mu and r must be positive")
-        for name in ("k", "num_sign_draws"):
+        for name in ("k", "num_sign_draws", "gram_max_bytes"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -80,6 +80,13 @@ class StepConfig:
             raise ValueError("mu_mode must be differentiated or detached")
         if self.fisher not in {"sampled", "empirical"}:
             raise ValueError("fisher must be sampled or empirical")
+        if self.kl_direction not in {"reference_to_current", "current_to_reference"}:
+            raise ValueError("unsupported kl_direction")
+        if not isinstance(self.block_path, str) or not self.block_path:
+            raise ValueError("block_path must name the transformer block container")
+        for name in ("drop_aln", "detach_lambda", "capture_offload", "contraction_tf32", "deterministic"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be boolean")
         if self.center_precision not in {"fp32", "bf16"}:
             raise ValueError("center_precision must be fp32 or bf16")
         if self.perturb_precision not in {"fp32", "tf32", "bf16"}:
@@ -88,7 +95,7 @@ class StepConfig:
             raise ValueError("capture_dtype must be model or bf16")
         if self.restore not in {"copy", "subtract"}:
             raise ValueError("restore must be copy or subtract")
-        for name in ("microbatch_tokens", "hvp_microbatch_tokens"):
+        for name in ("microbatch_tokens", "hvp_microbatch_tokens", "logprob_chunk_size"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a nonnegative integer")
@@ -119,6 +126,8 @@ def place_layers(model, devices, block_path="model.layers"):
     block -> device assignment. Inputs must be given on devices[0].
     """
     devices = [torch.device(d) for d in devices]
+    if not devices:
+        raise ValueError("at least one device is required")
     blocks = model.get_submodule(block_path)
     count = len(blocks)
     model.to(devices[0])
@@ -272,6 +281,8 @@ def _slice(tensor, chunk):
 
 def center_pass(model, joint, chunks, totals, config, modules, *, sample_generator=None, samples=None):
     """Stage 1-2: capture (X, Delta) over all micro-batches; returns (hooks, samples)."""
+    if _zero_safety_batch(joint):
+        raise DegenerateGeometry("identical safety pairs have zero margin geometry")
     device_type = joint.input_ids.device.type
     hooks = SpecLinearHooks(modules, num_examples=joint.m + joint.n, xi=config.xi,
                             max_bytes=config.gram_max_bytes, capture_dtype=config.capture_dtype,
@@ -318,32 +329,55 @@ def _endpoint_passes(model, chunks, totals, config, modules, w, cotangent, epsil
     device_type = chunks[0].batch.input_ids.device.type
     stats = dict(L_aln=0., L_bgn=0.)
     offset = 0.
-    with _deterministic(config.deterministic):
-        for sign in (1., -1.):
-            offset = _set_weights(modules, w, backup, offset, sign * epsilon, config)
-            for chunk in chunks:
-                with _autocast(device_type, config.perturb_precision):
-                    logits = _logits(model, chunk.batch)
-                values = measurements(logits, chunk.batch, samples=_slice(samples, chunk),
-                                      reference_logits=_slice(reference, chunk), fisher=config.fisher,
-                                      kl_direction=config.kl_direction,
-                                      logprob_chunk_size=config.logprob_chunk_size, totals=totals)
-                base = (0. if config.drop_aln else 1.) * values.alignment + config.alpha * values.benign_kl
-                loss = .5 * base_weight * base
-                if curvature_weight:
-                    a = cotangent[chunk.examples.to(cotangent.device)]
-                    omega = torch.dot(a.to(values.values.device), values.values.double())
-                    loss = loss + (sign * curvature_weight / epsilon) * omega
-                (loss * scale).backward()
-                stats["L_aln"] += .5 * float(values.alignment) * scale
-                stats["L_bgn"] += .5 * float(values.benign_kl) * scale
-                del logits, values, base, loss
-    _set_weights(modules, w, backup, offset, 0., config)
+    try:
+        with _deterministic(config.deterministic):
+            for sign in (1., -1.):
+                offset = _set_weights(modules, w, backup, offset, sign * epsilon, config)
+                for chunk in chunks:
+                    with _autocast(device_type, config.perturb_precision):
+                        logits = _logits(model, chunk.batch)
+                    values = measurements(logits, chunk.batch, samples=_slice(samples, chunk),
+                                          reference_logits=_slice(reference, chunk), fisher=config.fisher,
+                                          kl_direction=config.kl_direction,
+                                          logprob_chunk_size=config.logprob_chunk_size, totals=totals)
+                    base = (0. if config.drop_aln else 1.) * values.alignment + config.alpha * values.benign_kl
+                    loss = .5 * base_weight * base
+                    if curvature_weight:
+                        a = cotangent[chunk.examples.to(cotangent.device)]
+                        omega = torch.dot(a.to(values.values.device), values.values.double())
+                        loss = loss + (sign * curvature_weight / epsilon) * omega
+                    (loss * scale).backward()
+                    stats["L_aln"] += .5 * float(values.alignment) * scale
+                    stats["L_bgn"] += .5 * float(values.benign_kl) * scale
+                    del logits, values, base, loss
+    finally:
+        # A failed forward/backward must never leave live weights at an endpoint.
+        # Partially accumulated .grad buffers must be discarded by the caller.
+        _set_weights(modules, w, backup, offset, 0., config)
     return stats
 
 
 def _hvp_pass(model, chunks, totals, config, modules, w, cotangent, *, samples, reference, scale,
               curvature_weight, base_weight):
+    """Accumulate exact curvature on trainable coordinates while searching all U."""
+    # U defines the geometric search space; T defines the optimizer coordinates.
+    # Frozen weights in U still participate in the inner directional derivative.
+    trainable = tuple(p for p in model.parameters() if p.requires_grad)
+    frozen = [module.weight for module in modules.values() if not module.weight.requires_grad]
+    try:
+        for weight in frozen:
+            weight.requires_grad_(True)
+        return _hvp_pass_impl(model, chunks, totals, config, modules, w, cotangent,
+                              samples=samples, reference=reference, scale=scale,
+                              curvature_weight=curvature_weight, base_weight=base_weight,
+                              trainable=trainable)
+    finally:
+        for weight in frozen:
+            weight.requires_grad_(False)
+
+
+def _hvp_pass_impl(model, chunks, totals, config, modules, w, cotangent, *, samples, reference, scale,
+                   curvature_weight, base_weight, trainable):
     """Exact counterpart of ``_endpoint_passes``, accumulated into .grad.
 
     _endpoint_passes takes the gradient of
@@ -380,7 +414,7 @@ def _hvp_pass(model, chunks, totals, config, modules, w, cotangent, *, samples, 
             loss = loss + 2 * curvature_weight * directional
             del grads, directional
         if loss.requires_grad:
-            (loss * scale).backward()
+            torch.autograd.backward(loss * scale, inputs=trainable)
         stats["L_aln"] += float(values.alignment) * scale
         stats["L_bgn"] += float(values.benign_kl) * scale
         del logits, values, loss
@@ -408,7 +442,14 @@ def plain_gradient(model, joint, config, *, reference=None, samples=None, sample
             stats["L_aln"] += float(values.alignment)
             stats["L_bgn"] += float(values.benign_kl)
             del logits, values, loss
+    _check_gradients(model)
     return stats
+
+
+def _check_gradients(model):
+    for name, parameter in model.named_parameters():
+        if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all()):
+            raise FloatingPointError(f"nonfinite accumulated CBG gradient: {name}; discard .grad before retrying")
 
 
 def _final_norm(model, block_path):
@@ -541,6 +582,8 @@ def cbg_step(model, batch, config: StepConfig, *, reference=None, sample_generat
     L_bgn, nothing on a degenerate batch). Returns per-step diagnostics.
     """
     joint = batch if isinstance(batch, JointBatch) else joint_batch(batch)
+    if not any(p.requires_grad for p in model.parameters()):
+        raise ValueError("CBG requires at least one trainable parameter")
     if config.k > joint.m:
         raise ValueError("k cannot exceed the number of safety pairs")
     if not include_base:
@@ -567,16 +610,18 @@ def cbg_step(model, batch, config: StepConfig, *, reference=None, sample_generat
         return diagnostics
     with spec_precision(model, config.perturb_precision):
         phase = started
-        hooks, samples = center_pass(model, joint, chunks, totals, config, modules,
-                                     sample_generator=sample_generator, samples=fixed_samples)
-        phase, diagnostics["time_center"] = _clock(devices), _clock(devices) - phase
+        hooks, samples = None, fixed_samples
         try:
+            hooks, samples = center_pass(model, joint, chunks, totals, config, modules,
+                                         sample_generator=sample_generator, samples=fixed_samples)
+            phase, diagnostics["time_center"] = _clock(devices), _clock(devices) - phase
             kernel = hooks.K
             phase, diagnostics["time_gram"] = _clock(devices), _clock(devices) - phase
             spectrum = solve_spec_spectrum(kernel, joint.m, config.k, kappa_mu=config.kappa_mu,
                                            mu_mode=config.mu_mode)
         except DegenerateGeometry:
-            hooks.captures.clear()
+            if hooks is not None:
+                hooks.captures.clear()
             stats = plain_gradient(model, joint, config, reference=reference, samples=samples,
                                    chunks=chunks, totals=totals) if include_base else {}
             diagnostics.update(stats, geometry_active=0., geometry_skipped=1.,
@@ -606,12 +651,20 @@ def cbg_step(model, batch, config: StepConfig, *, reference=None, sample_generat
             if draw == draws - 1:
                 hooks.captures.clear()
             norm_sq = b @ kernel @ b
-            if not bool(torch.isfinite(norm_sq)) or bool(norm_sq <= 0):
-                raise FloatingPointError("RMS perturbation norm is zero, negative or nonfinite")
-            epsilon = 0. if hvp else config.r * math.sqrt(dim) / float(norm_sq.sqrt())
+            if not bool(torch.isfinite(norm_sq)) or bool(norm_sq < 0):
+                raise FloatingPointError("RMS perturbation norm is negative or nonfinite")
+            zero_direction = bool(norm_sq == 0)
+            epsilon = 0. if hvp or zero_direction else config.r * math.sqrt(dim) / float(norm_sq.sqrt())
             diagnostics["time_direction"] += _clock(devices) - phase
             phase = _clock(devices)
-            if hvp:
+            if zero_direction:
+                # G can vanish, for example for orthogonal safety/benign rows.
+                # The metric term has already been added; no curvature pass is needed.
+                stats = plain_gradient(model, joint, config, reference=reference, chunks=chunks,
+                                       totals=totals, scale=1. / draws) if include_base else dict(L_aln=0., L_bgn=0.)
+                if include_base:
+                    stats = {key: value / draws for key, value in stats.items()}
+            elif hvp:
                 stats = _hvp_pass(model, hvp_chunks, totals, config, modules, w, a, samples=samples,
                                   reference=reference, scale=1. / draws, curvature_weight=config.beta,
                                   base_weight=1. if include_base else 0.)
@@ -631,6 +684,7 @@ def cbg_step(model, batch, config: StepConfig, *, reference=None, sample_generat
         diagnostics.update(totals_stats)
         diagnostics["fraction_below_xi"] = float(
             sum(int((module.weight.detach().abs() < config.xi).sum()) for module in modules.values()) / dim)
+    _check_gradients(model)
     diagnostics.update(geometry_active=1., geometry_skipped=0., step_time=_clock(devices) - started)
     for index, device in enumerate(devices):
         if device.type == "cuda":

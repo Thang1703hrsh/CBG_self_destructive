@@ -1,8 +1,0 @@
-# Copy to your pilot_choices.yaml and set these author decisions explicitly.
-# Selected from the FP32 H200 radius sweep in
-# /vol/output/s0-spec-1b-h200-rsmall-20260930-a/radius.json.
-alpha: 1.0
-beta: 0.01
-xi: 0.001
-kappa_mu: 0.05
-relative_radius: 0.000001

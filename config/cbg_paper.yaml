@@ -1,0 +1,100 @@
+# Eq. (9), Algorithm 1, and Table 10 of No Cheap Escape.
+# Historical configs with 'final' in their names may implement different objectives.
+# Model revision is resolved to an immutable SHA during preparation.
+model: meta-llama/Llama-2-7b-chat-hf
+
+seeds:
+  seed: 42
+  data_split: 42
+  data_order: 43
+  y_hat_sampling: 44
+  sign_draws: 45
+  d_geo_y_hat: 1234
+
+data:
+  safety_source: https://raw.githubusercontent.com/domenicrosati/representation-noising/main/data/beavertails_with_refusals_train.json
+  safety_source_sha256: c3c92961d834afe3ecbfbfa29e87ca759b90a73498aaf807162328e0ebe8e4ee
+  split_policy: paper
+  text_format: paper
+  benign_shuffle: hf_dataset
+  order: sequential
+  test_size: 100
+  # Supply additional baseline-training prompts here before preparing a common test set.
+  eval_excluded_prompts: []
+  sizes:
+    defense: 4000
+    attack: 1000
+    benign: 4000
+    benign_attack: 1000
+    d_geo_safety: 64
+    d_geo_benign: 256
+    d_val_atk: 1000
+    d_atk_10k: 10000
+
+lengths:
+  safety: 256
+  benign: 256
+  min_response_tokens: null
+
+method:
+  alpha: 1.0
+  beta: 0.1
+  kappa_mu: 1.0
+  xi: 0.001
+  k: 4
+  mu_mode: differentiated
+  benign_metric: sampled_fisher
+  estimator: shared_sign
+  num_sign_draws: 1
+  curvature: hvp
+  # Used only for finite-difference diagnostics, not by the HVP update.
+  radius: 1.1e-7
+  kl_direction: reference_to_current
+  lazy_period: 1
+  ul_weight: 0.0
+  geometry_trajectory: [0.0]
+
+batch:
+  m: 8
+  n: 32
+
+execution:
+  devices: 2
+  placement: layer_split
+  microbatch_tokens: 2048
+  hvp_microbatch_tokens: 1024
+  center_precision: bf16
+  perturb_precision: fp32
+  hvp_precision: tf32
+  plain_precision: fp32
+  capture_dtype: bf16
+  capture_offload: false
+  contraction_tf32: true
+  restore: copy
+  gram_max_bytes: 4294967296
+  logprob_chunk_size: 256
+  deterministic_perturbed_passes: true
+  hvp_check_tolerance: 0.10
+  hvp_check_min_cosine: 0.995
+
+optimizer:
+  name: adamw
+  fused: true
+  lr: 2.0e-5
+  steps: 500
+  scheduler: cosine
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  grad_clip: null
+
+logging:
+  geo_eval_every: 50
+  grad_ratio_every: 0
+  checkpoint_every: 100
+  keep_last_checkpoint: false
+  utility_window: 25
+  early_stop:
+    - step: 100
+      max_mean_l_bgn: 0.3
+    - step: 250
+      max_mean_l_bgn: 0.3

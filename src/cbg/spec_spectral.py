@@ -1,4 +1,4 @@
-"""Small FP64 solves for CBG_v2_method_spec.md, section 5.
+"""Small FP64 solves for Eqs. (7), (8), and (13) of the CBG paper.
 
 The legacy dual/Rayleigh modules implement a different, unnormalized objective.
 This module deliberately keeps that API separate from the specified log-eta loss.
@@ -110,9 +110,11 @@ def solve_spec_spectrum(kernel: Tensor, m: int, k: int, *, kappa_mu: float,
         raise FloatingPointError("CBG Gram is not positive semidefinite")
     hh, hb, bb = K[:m, :m], K[:m, m:], K[m:, m:]
     mu = kappa_mu * bb.trace() / n if fixed_mu is None else torch.as_tensor(fixed_mu).to(K).detach()
+    if mu.ndim != 0 or not bool(torch.isfinite(mu)):
+        raise FloatingPointError("mu must be a finite scalar")
     if bool(mu == 0):
         raise DegenerateGeometry("zero benign Gram: damping is zero")
-    if mu.numel() != 1 or not bool(torch.isfinite(mu)) or not bool(mu > 0):
+    if not bool(mu > 0):
         raise FloatingPointError("mu must be positive; the benign Gram trace may be zero")
     chol = torch.linalg.cholesky(bb + mu * torch.eye(n, device=K.device, dtype=K.dtype))
     solved = torch.cholesky_solve(hb.T, chol)
@@ -142,7 +144,7 @@ def solve_spec_spectrum(kernel: Tensor, m: int, k: int, *, kappa_mu: float,
     nu, yp = nu.flip(0), yp.flip(1)
     sigma_sum, nu_sum = mu*rho[:k].sum(), nu[:k].sum()
     if (not bool(torch.isfinite(sigma_sum)) or not bool(torch.isfinite(nu_sum))
-        or bool(sigma_sum <= 1e-30) or bool(nu_sum <= 1e-30)):
+        or bool(sigma_sum <= 0) or bool(nu_sum <= 0)):
         raise DegenerateGeometry("CBG spectral sum is zero/nonfinite")
     phi, phi2 = y[:, :k], yp[:, :k]
     Z = solved @ phi
@@ -164,7 +166,7 @@ def solve_spec_spectrum(kernel: Tensor, m: int, k: int, *, kappa_mu: float,
             continue
         gap = values[k-1] - (values[k] if k < len(values) else 0)
         if bool(gap / values[0].abs().clamp_min(1e-300) < 1e-3):
-            warnings.warn(f"small {label} gap at k: using a Clarke subgradient", RuntimeWarning)
+            warnings.warn(f"small {label} gap at k: log-eta differentiability is not guaranteed", RuntimeWarning)
     c_mu = Z.square().sum() / (mu*S)
     G = psi @ psi.T / (mu*S) - psi2 @ psi2.T / N
     if mu_mode == "differentiated":

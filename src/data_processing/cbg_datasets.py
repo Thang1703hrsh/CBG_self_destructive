@@ -325,7 +325,8 @@ def tokenize_paired_responses(
     return harmful, safe
 
 
-def tokenize_seam_text(tokenizer: Any, prompt_text: str, full_text: str, *, max_length: int) -> SequenceExample:
+def tokenize_seam_text(tokenizer: Any, prompt_text: str, full_text: str, *, max_length: int,
+                       allow_truncated_response: bool = True) -> SequenceExample:
     """Tokenize exactly like SEAM: ``tokenizer(full_text, truncation=True, max_length)``.
 
     The whole string is tokenized in one pass (BOS, no EOS) and truncated on the
@@ -333,13 +334,16 @@ def tokenize_seam_text(tokenizer: Any, prompt_text: str, full_text: str, *, max_
     after the tokenization of ``prompt_text``, which must be a token prefix of
     the full string (checked; it holds for SentencePiece when the response
     starts with a space or newline). If truncation removes the whole response,
-    the last kept token is used as the response position.
+    the legacy default uses the last kept token as the response position.
+    The paper format disables this fallback: prompt tokens are never responses.
     """
     full = _prompt_token_ids(tokenizer, full_text, add_bos=True)
     prompt = _prompt_token_ids(tokenizer, prompt_text, add_bos=True)
     if full[:len(prompt)] != prompt:
         raise ValueError("prompt tokens are not a prefix of the SEAM-formatted sequence")
     full = full[:max_length]
+    if not allow_truncated_response and len(full) <= len(prompt):
+        raise ValueError("truncation removed the entire response; filter this record or increase max_length")
     # SEAM keeps sequences whose prompt alone fills max_length (its loss covers
     # every token). Keep the same tokens; CBG measures their last kept token.
     boundary = min(len(prompt), len(full) - 1)
@@ -465,8 +469,8 @@ class CbgPairedSafetyDataset(Dataset[PairedSafetyExample]):
         min_response_tokens: int | None = None,
         text_format: str = "cbg",
     ) -> None:
-        if text_format not in {"cbg", "seam"}:
-            raise ValueError("text_format must be cbg or seam")
+        if text_format not in {"cbg", "seam", "paper"}:
+            raise ValueError("text_format must be cbg, seam or paper")
         self.text_format = text_format
         if source_indices is None:
             source_indices = tuple(range(len(records)))
@@ -486,11 +490,13 @@ class CbgPairedSafetyDataset(Dataset[PairedSafetyExample]):
 
     def __getitem__(self, index: int) -> PairedSafetyExample:
         record = self.records[index]
-        if self.text_format == "seam":
+        if self.text_format in {"seam", "paper"}:
             prompt_text, harmful_text, safe_text = seam_safety_texts(record)
             return {
-                "harmful": tokenize_seam_text(self.tokenizer, prompt_text, harmful_text, max_length=self.max_length),
-                "safe": tokenize_seam_text(self.tokenizer, prompt_text, safe_text, max_length=self.max_length),
+                "harmful": tokenize_seam_text(self.tokenizer, prompt_text, harmful_text, max_length=self.max_length,
+                                               allow_truncated_response=self.text_format == "seam"),
+                "safe": tokenize_seam_text(self.tokenizer, prompt_text, safe_text, max_length=self.max_length,
+                                            allow_truncated_response=self.text_format == "seam"),
                 "pair_id": self.source_indices[index],
             }
         prompt = str(record["prompt"])
@@ -529,8 +535,8 @@ class CbgBenignDataset(Dataset[SequenceExample]):
         min_response_tokens: int | None = None,
         text_format: str = "cbg",
     ) -> None:
-        if text_format not in {"cbg", "seam"}:
-            raise ValueError("text_format must be cbg or seam")
+        if text_format not in {"cbg", "seam", "paper"}:
+            raise ValueError("text_format must be cbg, seam or paper")
         self.text_format = text_format
         self.records = records
         self.tokenizer = tokenizer
@@ -545,9 +551,10 @@ class CbgBenignDataset(Dataset[SequenceExample]):
 
     def __getitem__(self, index: int) -> SequenceExample:
         record = self.records[index]
-        if self.text_format == "seam":
+        if self.text_format in {"seam", "paper"}:
             prompt_text, full_text = seam_benign_texts(record)
-            return tokenize_seam_text(self.tokenizer, prompt_text, full_text, max_length=self.max_length)
+            return tokenize_seam_text(self.tokenizer, prompt_text, full_text, max_length=self.max_length,
+                                      allow_truncated_response=self.text_format == "seam")
         instruction = str(record.get("instruction", ""))
         input_text = str(record.get("input", ""))
         output_text = str(record.get("output", "")).strip()

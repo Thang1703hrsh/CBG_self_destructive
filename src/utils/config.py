@@ -1,4 +1,5 @@
 import argparse
+import copy
 from argparse import ArgumentParser
 import dataclasses
 import sys
@@ -24,6 +25,15 @@ def load_yaml_config(config_path):
         return yaml.safe_load(f)
     
 class MyParser(HfArgumentParser):
+    @staticmethod
+    def _parse_dataclass_field(parser, field):
+        # Transformers pops parser options from metadata.copy(). Some Python
+        # versions return an immutable mapping from that call. Keep the
+        # library's parsing logic, supplying a private mutable metadata copy.
+        field = copy.copy(field)
+        field.metadata = dict(field.metadata)
+        HfArgumentParser._parse_dataclass_field(parser, field)
+
     def parse_args_into_dataclasses(
         self,
         args=None,

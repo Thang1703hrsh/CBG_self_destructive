@@ -4,7 +4,7 @@ SEAM (seam/src/eval.py + seam/src/utils/metrics.py::eval_utility): bf16 model, t
 lm_eval.simple_evaluate on an HFLM wrapper, default (zero-shot) prompts, batch size 24. Same here.
 
   python -m src.experiments.utility_eval --model results/.../final --output results/utility/cbg-hvp
-  python -m src.experiments.utility_eval --model ducthang1703/cbg-hvp-llama2-7b --output results/utility/cbg-hvp
+  python -m src.experiments.utility_eval --model /path/to/checkpoint --output results/utility/cbg-hvp
   python -m src.experiments.utility_eval --model meta-llama/Llama-2-7b-chat-hf --output results/utility/base
 
 --model is a local folder or a Hugging Face repo (private repos need HF_TOKEN). Results go to

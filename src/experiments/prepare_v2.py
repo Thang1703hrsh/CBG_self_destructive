@@ -1,4 +1,7 @@
-"""Data pools + pinned model for CBG v2 (SEAM main-run recipe), shared by Modal and local servers.
+"""Prepare CBG data pools and pin the model revision for local training.
+
+The data.split_policy setting selects the paper's prompt-disjoint recipe or
+the historical SEAM row-split recipe. Use config/cbg_paper.yaml for the former.
 
 Downloads the pinned RepNoise JSON (SHA-256 checked), BeaverTails 30k_test / 330k_train and
 Alpaca at pinned revisions, builds the pools (src/experiments/seam_data.py), downloads the model
@@ -18,7 +21,7 @@ import urllib.request
 
 import yaml
 
-from src.experiments.protocol import file_digest, read_json, write_json
+from src.experiments.protocol import digest, file_digest, read_json, write_json
 
 ALPACA_REVISION = "12567cabf869d7c92e573c7c783905fc160e9639"
 BEAVERTAILS_REVISION = "325c10601deaf84618333d9624a0637543e9ae62"
@@ -27,10 +30,33 @@ MODEL_PATTERNS = ["*.json", "*.safetensors", "tokenizer.model", "merges.txt"]   
 MODEL_IGNORE = ["consolidated*"]
 
 
+def preparation_identity(config):
+    return digest({key: config.get(key) for key in ("model", "model_revision", "data", "lengths")} |
+                  {"data_split": config["seeds"]["data_split"]})
+
+
+def validate_paper_data(config, target):
+    """Reject legacy, modified, or differently configured pools for paper runs."""
+    if config["data"].get("split_policy", "seam") != "paper":
+        return
+    target = Path(target)
+    manifest = read_json(target / "manifest.json")
+    if (manifest.get("schema") != "cbg_paper_1"
+        or manifest.get("sha256") != digest({k: v for k, v in manifest.items() if k != "sha256"})
+        or manifest.get("sources", {}).get("preparation_sha256") != preparation_identity(config)):
+        raise ValueError("paper data manifest is legacy, modified, or for another preparation config; prepare a new directory")
+    for name in (*config["data"]["sizes"], "eval_harm"):
+        info = manifest.get("files", {}).get(name)
+        expected = config["data"]["test_size"] if name == "eval_harm" else config["data"]["sizes"][name]
+        if not info or info["count"] != expected or file_digest(target / f"{name}.json") != info["sha256"]:
+            raise ValueError(f"paper data count or hash mismatch: {name}")
+
+
 def prepare_data(config, target):
     """Build every pool under ``target``; refuses to overwrite a prepared directory."""
     target = Path(target)
     if (target / "manifest.json").exists():
+        validate_paper_data(config, target)
         if (target / "model_revision.json").exists():
             raise ValueError(f"{target} already prepared; use a new directory to rebuild")
         # The pools were written but the model step failed (e.g. a 401 from Hugging Face):
@@ -56,12 +82,17 @@ def prepare_data(config, target):
                                   revision=ALPACA_REVISION)
     alpaca = json.loads(Path(alpaca_path).read_text(encoding="utf-8"))
     pools = build_pools(repnoise, extra, evaluation, alpaca, data["sizes"], seed=config["seeds"]["data_split"],
-                        benign_shuffle=data["benign_shuffle"], test_size=data["test_size"])
+                        benign_shuffle=data["benign_shuffle"], test_size=data["test_size"],
+                        split_policy=data.get("split_policy", "seam"),
+                        eval_excluded_prompts=data.get("eval_excluded_prompts", ()))
     model = config["model"]
     revision = config.get("model_revision") or HfApi().model_info(model).sha
-    sources = dict(repnoise=dict(url=data["safety_source"], sha256=data["safety_source_sha256"]),
+    sources = dict(preparation_sha256=preparation_identity(config),
+                   repnoise=dict(url=data["safety_source"], sha256=data["safety_source_sha256"]),
                    seam_split=dict(seed=config["seeds"]["data_split"], shuffle="random.Random(seed).shuffle",
-                                   benign_shuffle=data["benign_shuffle"], test_size=data["test_size"]),
+                                   benign_shuffle=data["benign_shuffle"], test_size=data["test_size"],
+                                   split_policy=data.get("split_policy", "seam"),
+                                   eval_excluded_prompts=data.get("eval_excluded_prompts", [])),
                    beavertails=dict(revision=BEAVERTAILS_REVISION, eval="30k_test", extra="330k_train"),
                    alpaca=dict(repo="yahma/alpaca-cleaned", revision=ALPACA_REVISION),
                    model=dict(name=model, revision=revision))
@@ -115,6 +146,8 @@ def main(argv=None):
         print(model_path(args.data))
         return
     if (Path(args.data) / "model_revision.json").exists():   # written last by a complete prepare
+        if args.config:
+            validate_paper_data(yaml.safe_load(Path(args.config).read_text(encoding="utf-8")), args.data)
         print(f"{args.data} already prepared", flush=True)
         return
     if not args.config:

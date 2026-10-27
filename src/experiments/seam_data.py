@@ -1,4 +1,8 @@
-"""CBG v2 data pools prepared exactly like the SEAM main run (SEAM_DATA_PREPARATION.md).
+"""Legacy SEAM data pools and the paper's prompt-disjoint preparation policy.
+
+The default ``split_policy="seam"`` preserves the historical row recipe below.
+``split_policy="paper"`` excludes overlapping prompts, filters test categories
+on the corresponding rows, and reserves benign fine-tuning data separately.
 
 SEAM main run (scripts/modal_seam_full.py in the SEAM project, Run-SEAMFull.ps1, seed 42):
   1. keep RepNoise ``beavertails_with_refusals_train.json`` rows with ``is_safe is False``
@@ -8,7 +12,7 @@ SEAM main run (scripts/modal_seam_full.py in the SEAM project, Run-SEAMFull.ps1,
   4. benign = ``yahma/alpaca-cleaned`` train shuffled with ``benign_seed = seed``, first 4,000 rows;
   5. harmfulness test = BeaverTails ``30k_test`` through SEAM's filter, first ``test_size=100`` prompts.
 
-These SEAM pools are reproduced row for row and are never altered. CBG needs a
+In legacy mode these SEAM pools are reproduced row for row. CBG needs a
 few pools that SEAM does not have (D_geo, D_val_atk, a 10K attack pool); they
 are drawn after row 5,000 of the same shuffled list (then BeaverTails
 330k_train), prompt-disjoint from every SEAM pool and from the test split.
@@ -89,7 +93,14 @@ def _record(row, source, index):
 
 
 def build_pools(repnoise, beavertails_extra, test_rows, alpaca, sizes, *, seed=42, benign_shuffle="hf_dataset",
-                test_size=100):
+                test_size=100, split_policy="seam", eval_excluded_prompts=()):
+    """Build legacy row splits or the paper's prompt-disjoint splits.
+
+    ``eval_excluded_prompts`` supplies any additional baseline-training prompts
+    that must be excluded from the common harmfulness test set.
+    """
+    if split_policy not in {"seam", "paper"}:
+        raise ValueError("split_policy must be seam or paper")
     valid = seam_valid_rows(repnoise)
     index_of = {id(row): i for i, row in enumerate(repnoise)}
     shuffled = list(valid)
@@ -100,10 +111,20 @@ def build_pools(repnoise, beavertails_extra, test_rows, alpaca, sizes, *, seed=4
     rows = [_record(row, "repnoise", index_of[id(row)]) for row in shuffled]
     pools = dict(defense=rows[:sizes["defense"]], attack=rows[sizes["defense"]:need])
 
+    if split_policy == "paper":
+        defense_prompts = {prompt_key(r["prompt"]) for r in pools["defense"]}
+        candidates = [r for r in rows[sizes["defense"]:] if prompt_key(r["prompt"]) not in defense_prompts]
+        pools["attack"] = candidates[:sizes["attack"]]
+        if len(pools["attack"]) != sizes["attack"]:
+            raise ValueError("not enough prompt-disjoint harmful attack rows")
+        selected = {r["source_index"] for r in pools["defense"] + pools["attack"]}
+        rest = [r for r in rows if r["source_index"] not in selected]
+    else:
+        rest = rows[need:]
+
     # CBG-only pools: after row 5,000 of the same shuffled list, prompt-disjoint.
     excluded = {prompt_key(r["prompt"]) for r in test_rows}
     used = {prompt_key(r["prompt"]) for r in pools["defense"] + pools["attack"]}
-    rest = rows[need:]
     extra = [_record(r, "beavertails_330k_train", i) for i, r in enumerate(beavertails_extra)
              if r.get("is_safe") is False and r.get("prompt") and r.get("response")]
 
@@ -134,10 +155,52 @@ def build_pools(repnoise, beavertails_extra, test_rows, alpaca, sizes, *, seed=4
     order = alpaca_order(len(alpaca), seed, benign_shuffle)
     benign = [dict(instruction=alpaca[i]["instruction"], input=alpaca[i]["input"], output=alpaca[i]["output"],
                    source_index=i) for i in order]
+    if len(benign) < sizes["benign"] + sizes["d_geo_benign"]:
+        raise ValueError("not enough benign training and geometry rows")
     pools["benign"] = benign[:sizes["benign"]]
     pools["d_geo_benign"] = benign[sizes["benign"]:sizes["benign"] + sizes["d_geo_benign"]]
-    pools["eval_harm"] = [dict(prompt=p) for p in seam_test_prompts(test_rows, test_size)]
+    if split_policy == "paper":
+        # Exclude prompts rather than only row IDs; duplicate instructions are
+        # common in instruction datasets. Reserve benign FT before D_geo.
+        benign_used = {_benign_key(r) for r in pools["benign"]}
+        candidates = [r for r in benign[sizes["benign"]:] if _benign_key(r) not in benign_used]
+        cursor = 0
+        for name, size in (("benign_attack", sizes.get("benign_attack", 1000)),
+                           ("d_geo_benign", sizes["d_geo_benign"])):
+            chosen = []
+            while cursor < len(candidates) and len(chosen) < size:
+                row = candidates[cursor]
+                cursor += 1
+                key = _benign_key(row)
+                if key not in benign_used:
+                    chosen.append(row)
+                    benign_used.add(key)
+            if len(chosen) != size:
+                raise ValueError(f"not enough prompt-disjoint rows for {name}")
+            pools[name] = chosen
+        blocked = used | {prompt_key(p) for p in eval_excluded_prompts}
+        prompts = []
+        categories = {c for values in BT_CATEGORIES.values() for c in values}
+        for row in test_rows:
+            prompt = row.get("prompt", "")
+            key = prompt_key(prompt)
+            if (not prompt or row.get("is_safe") is not False or key in blocked
+                or not any(value and category in categories for category, value in row.get("category", {}).items())):
+                continue
+            prompts.append(dict(prompt=prompt))
+            blocked.add(key)
+            if len(prompts) == test_size:
+                break
+        if len(prompts) != test_size:
+            raise ValueError("not enough prompt-disjoint harmfulness test prompts")
+        pools["eval_harm"] = prompts
+    else:
+        pools["eval_harm"] = [dict(prompt=p) for p in seam_test_prompts(test_rows, test_size)]
     return pools
+
+
+def _benign_key(row):
+    return prompt_key(f"{row['instruction']}\n{row.get('input', '')}")
 
 
 def write_pools(pools, directory, sources):
@@ -153,6 +216,15 @@ def write_pools(pools, directory, sources):
     report = dict(defense_unique_prompts=len(keys["defense"]), attack_unique_prompts=len(keys["attack"]),
                   defense_attack_shared_prompts=len(keys["defense"] & keys["attack"]),
                   defense_eval_shared_prompts=len(keys["defense"] & keys["eval_harm"]))
+    policy = sources.get("seam_split", {}).get("split_policy", "seam")
+    if policy == "paper":
+        for left, right in (("defense", "attack"), ("defense", "eval_harm"), ("attack", "eval_harm")):
+            if keys[left] & keys[right]:
+                raise ValueError(f"paper split leaks prompts between {left} and {right}")
+        for left, right in (("benign", "benign_attack"), ("benign", "d_geo_benign"),
+                            ("benign_attack", "d_geo_benign")):
+            if {_benign_key(r) for r in pools[left]} & {_benign_key(r) for r in pools[right]}:
+                raise ValueError(f"paper split leaks prompts between {left} and {right}")
     cbg_only = {"d_geo_safety": ("defense", "attack", "eval_harm", "d_val_atk", "d_atk_10k"),
                 "d_val_atk": ("defense", "attack", "eval_harm", "d_atk_10k")}
     for name, others in cbg_only.items():
@@ -164,7 +236,8 @@ def write_pools(pools, directory, sources):
     benign_keys = lambda rows: {r["source_index"] for r in rows}
     if benign_keys(pools["benign"]) & benign_keys(pools["d_geo_benign"]):
         raise ValueError("D_geo benign overlaps the benign training rows")
-    manifest = dict(schema="cbg_v2_seam_main_run_1", sources=sources, files=files, overlap_report=report,
+    manifest = dict(schema="cbg_paper_1" if policy == "paper" else "cbg_v2_seam_main_run_1",
+                    sources=sources, files=files, overlap_report=report,
                     seam_pools=["defense", "attack", "benign", "eval_harm"],
                     cbg_only_pools=["d_geo_safety", "d_val_atk", "d_atk_10k", "d_geo_benign"],
                     d_atk_10k="attack.json (1,000 rows, SEAM) followed by 9,000 CBG-only rows")

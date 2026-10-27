@@ -1,6 +1,7 @@
 """Attack-trajectory diagnostics on a tiny Llama, on CPU."""
 import os
 os.environ.setdefault("USE_TF", "0")
+import importlib.util
 import json
 from pathlib import Path
 import tempfile
@@ -33,6 +34,8 @@ def load(path):
 
 
 class AttackTrajectoryTest(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("peft") is not None,
+                         "optional LoRA integration needs peft; install requirements-dev.txt")
     def test_cosine_is_one_along_the_top_safety_direction_and_lora_deltas_are_exact(self):
         from peft import LoraConfig, get_peft_model
         from src.cbg.spec_hooks import spec_linear_modules

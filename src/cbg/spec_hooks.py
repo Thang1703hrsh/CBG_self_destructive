@@ -228,7 +228,7 @@ class SpecLinearHooks:
                     self.d_lambda_sq += float(value.double().square().sum())
                     if self.d_lambda_scale is None:
                         self.d_lambda[name][start:end] = value
-                    else:
+                    elif module.weight.requires_grad:
                         if module.weight.grad is None:
                             module.weight.grad = torch.zeros_like(weight)
                         module.weight.grad[start:end].add_(value.to(weight.dtype), alpha=self.d_lambda_scale)

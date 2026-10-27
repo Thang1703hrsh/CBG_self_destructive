@@ -1,42 +1,11 @@
-# Running on the 2× H200 server
+# Scripts
 
-## Setup (once)
+Run commands from the repository root. The Python modules are the portable entry points.
 
-```bash
-cd ~/CBG_self_destructive
-pip install -r requirements.txt
-export HF_TOKEN=hf_xxx        # Llama-2 + Mistral access, WRITE permission
-```
+- `train_cbg.sh`: wrapper for `python -m src.cbg.train_v2 --config config/cbg_paper.yaml`. Pass `--data`, `--model`, `--output`, and optionally `--stage` or `--resume`.
+- `run_utility_eval.sh`: compare a supplied `CBG_MODEL` with `BASE_MODEL` on two visible GPUs. The default tasks are TruthfulQA-MC1, MMLU, HellaSwag, and ARC-Easy. Set `TASKS` to restrict the task list.
+- `cbg_fixed_batch_descent.py` and `cbg_five_step_probe.py`: development probes, not paper-training entry points. Use their `--help` output for arguments.
 
-## 1. CBG on Qwen2.5-7B and Mistral-7B
+For data preparation, use `python -m src.experiments.prepare_v2 --help`. For evaluation, use `python -m src.experiments.attack_eval --help` or `python -m src.experiments.utility_eval --help`.
 
-```bash
-nohup bash scripts/run_new_models.sh > new_models.log 2>&1 &
-tail -f new_models.log
-```
-
-Results: `results/new-models/<model>/summary_test.md`
-
-## 2. Mechanism experiments (β = 0 ablation + attack trajectory)
-
-```bash
-nohup bash scripts/run_mechanism.sh > mechanism.log 2>&1 &
-tail -f mechanism.log
-```
-
-Results: `results/mechanism/summary_mechanism.md`
-
-## Both, one after the other
-
-```bash
-nohup bash -c "bash scripts/run_new_models.sh > new_models.log 2>&1; bash scripts/run_mechanism.sh > mechanism.log 2>&1" &
-```
-
-Do not run the two scripts at the same time (each needs both GPUs).
-
-## Notes
-
-- Interrupted: run the same command again; finished steps are skipped.
-- Errors: `cat results/new-models/*/failures.txt` or `cat results/mechanism/failures.txt`.
-- Everything (weights, results, losses, logs) is pushed to Hugging Face as **public**. Add `HF_PUBLIC=0` for private, `HF_UPLOAD=0` for no upload.
-- One model only: `ONLY_MODELS=qwen25-7b` (script 1) or `ONLY_MODELS="base cbg"` (script 2).
+Account-specific PowerShell/Modal launchers and old orchestration scripts are preserved in the ignored local cleanup archive. They are excluded from the source release. The retained scripts do not automatically publish models or results.

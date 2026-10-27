@@ -953,7 +953,7 @@ class CbgTrainer(Trainer):
                     logger.warning(
                         "dual verification failed after column-width retries; "
                         "recomputing the same V5 operator with functional chunk 1 and dual width 1: %s",
-                        error,
+                        str(error),
                     )
                     retry_scalar = True
                 # Leave the exception handler BEFORE allocating retry graphs:

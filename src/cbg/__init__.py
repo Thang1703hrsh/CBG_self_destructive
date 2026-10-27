@@ -1,5 +1,6 @@
 """Mathematical core for Collateral Barrier Geometry (CBG)."""
 
+from src.cbg.step_v2 import StepConfig, cbg_step
 from src.cbg.dual import build_functional_kernel, dual_rayleigh_solve
 from src.cbg.bounded import bounded_rayleigh_solve, compute_complement_enclosure
 from src.cbg.spec import SpecConfig, SpecStepResult, measure_geometry, spec_training_gradient
@@ -59,6 +60,7 @@ from src.cbg.tree_ops import (
 )
 
 __all__ = [
+    "StepConfig", "cbg_step",
     "SpecConfig", "SpecStepResult", "measure_geometry", "spec_training_gradient",
     "bounded_rayleigh_solve",
     "compute_complement_enclosure",
