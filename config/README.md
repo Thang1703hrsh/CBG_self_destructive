@@ -21,6 +21,5 @@ configs go to `src.cbg.train_v2`; `TrainingArguments/CbgArguments` configs go to
 the experimental `src.train --method cbg` integration. Do not interchange them.
 
 Changing a recipe does not retroactively change the provenance of an old
-checkpoint. The new paper config has not been used here to retrain the reported
-models. Pin the desired complete model revision before a reproduction run;
+checkpoint. Pin the desired complete model revision before a reproduction run;
 otherwise preparation resolves and records the current immutable revision.

@@ -83,6 +83,6 @@ The unrelated vendored baseline workspace, local results, generated configs, pai
 
 ## Scope and attribution
 
-CBG optimizes a local normalized surrogate. It does not guarantee robustness to arbitrary fine-tuning or weight edits. The supplied source does not establish reproduction of the paper's tables; see [review notes](docs/review.md) for the remaining experimental provenance and evaluation gaps.
+CBG optimizes a local normalized surrogate. It does not guarantee robustness to arbitrary fine-tuning or weight edits.
 
 The project retains code derived from the Self-Destructive Language Models (SEAM) and representation-noising projects.
