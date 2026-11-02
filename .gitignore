@@ -4,41 +4,18 @@ __pycache__/
 .pytest_cache/
 .coverage
 .coverage.*
-htmlcov/
-.ruff_cache/
-.mypy_cache/
-.tox/
-build/
-dist/
 *.egg-info/
-.venv/
-venv/
-env/
-.idea/
-.vscode/
 
 # Credentials and local service state
 .env
 .env.*
 !.env.example
-.modal/
-.huggingface/
-wandb/
 *.log
 
 # Data, model weights, and generated run artifacts
 /data/*
 !/data/*.py
-/results/
-/output/
-/outputs/
-/ckpt/
-/checkpoints/
-/trainer_output/
-/logs/
 /tmp/
-/config/generated/
-/pilot_choices.yaml
 *.pt
 *.pth
 *.ckpt
@@ -55,7 +32,6 @@ wandb/
 # Tests retained locally
 /tests/
 
-# Local implementation notes and manuscript drafts
+# Local documentation and backup files
 /docs/
-/CBG_CODEX_IMPLEMENTATION_GUIDE*.md
 *.backup-*
