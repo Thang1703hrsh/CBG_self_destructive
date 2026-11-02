@@ -52,6 +52,10 @@ wandb/
 # Unrelated baseline workspace retained locally
 /seam/
 
+# Tests retained locally
+/tests/
+
 # Local implementation notes and manuscript drafts
+/docs/
 /CBG_CODEX_IMPLEMENTATION_GUIDE*.md
 *.backup-*

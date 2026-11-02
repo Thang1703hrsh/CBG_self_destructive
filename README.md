@@ -77,7 +77,7 @@ The model must use FP32 master weights (FP64 is supported for validation). Disab
 - `src/data_processing/cbg_datasets.py`: paired safety and benign tokenization and collation.
 - `src/experiments/`: preparation, fixed-batch geometry probes, attacks, evaluation, and explicit upload helpers.
 - `tests/`: numerical oracles, gradient and masking regressions, and tiny-model integration tests.
-- `src/core/cbg_trainer.py`, `src/train.py`: retained experimental Trainer integration; older V2/V5 objectives differ from the paper.
+- `src/core/cbg_trainer.py`, `src/train.py`: retained experimental Trainer integration.
 
 The unrelated vendored baseline workspace, local results, generated configs, paid refusal-generation script, and account-specific launchers have been excluded from the release. The cleanup preserves these local files under ignored `tmp/local-archive/`; that archive is not part of a fresh clone.
 
