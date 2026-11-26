@@ -1,0 +1,14 @@
+# CTRAP's original training stack (separate environment .venv-ctrap, Python 3.10).
+torch==2.1.0
+transformers==4.45.2
+peft==0.5.0
+accelerate==1.0.1
+datasets==2.14.7
+pyarrow==14.0.1
+numpy==1.24.1
+huggingface-hub==0.25.2
+wandb==0.16.1
+sentencepiece==0.1.99
+scipy==1.11.3
+packaging==23.2
+protobuf==3.20.3

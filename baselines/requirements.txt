@@ -1,0 +1,5 @@
+# Extra packages for the baselines, on top of the repository requirements.txt (same main environment).
+sentence-transformers==3.4.1
+bitsandbytes==0.45.2
+sentencepiece==0.2.0
+requests==2.32.3

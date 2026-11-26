@@ -29,6 +29,11 @@ __pycache__/
 # Unrelated baseline workspace retained locally
 /seam/
 
+# Virtual environments and baseline run outputs (checkpoints, results, logs)
+/.venv/
+/.venv-ctrap/
+/outputs/
+
 # Tests retained locally
 /tests/
 
